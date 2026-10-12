@@ -34,6 +34,8 @@ the plugin switches it off if it finds it on.
 3. Restart KOReader. The menu is under Tools → *Progress sync: Wi-Fi on demand*.
 
 A *Sync now* entry and a dispatcher action (gestures / profiles) are provided.
+Sync now pushes and pulls and shows one summary line; when KOSync asks whether
+to move to the newer location, the summary is skipped so nothing overlaps.
 
 ## Settings
 

@@ -14,8 +14,10 @@ function UIManager:scheduleIn(s, fn, ...) local args = {...}; table.insert(tasks
 function UIManager:nextTick(fn, ...) return self:scheduleIn(0, fn, ...) end
 function UIManager:unschedule(fn) local n = 0 for i = #tasks, 1, -1 do if tasks[i].fn == fn then table.remove(tasks, i) n = n + 1 end end return n > 0 end
 function UIManager:broadcastEvent(ev) say("  [event]", ev.name) end
-function UIManager:show(w) say("  [show]" .. (w.modal and " (modal)" or ""), w.text or "?") end
-function UIManager:close(w) say("  [close]", w.text or "?") end
+UIManager.top = nil
+function UIManager:show(w) say("  [show]" .. (w.modal and " (modal)" or ""), w.text or "?") self.top = w end
+function UIManager:close(w) say("  [close]", w.text or "?") if self.top == w then self.top = nil end end
+function UIManager:getTopmostVisibleWidget() return self.top end
 function UIManager:forceRePaint() end
 function UIManager:setDirty(w, t) say("  [refresh]", t) end
 function UIManager:getElapsedTimeSinceBoot() return now end
@@ -123,7 +125,8 @@ local function resetKOSync()
         settings = { username = "u", userkey = "k", custom_server = "https://sync.example", kosync_hostname = "Clara", auto_sync = false },
         device_id = "DEV", push_timestamp = 0, pull_timestamp = 0, last_page_turn_timestamp = 0,
     }
-    function kosync:updateProgress()
+    function kosync:updateProgress(ensure, interactive)
+        if interactive then say("  [kosync] updateProgress interactive=true") end
         if push_fails then say("  [kosync] updateProgress FAILED -> queued") KOSyncQueue:push({ document = "digest1", device_id = "DEV" }) return end
         say("  [kosync] updateProgress route=" .. tostring(wifi.route))
     end
@@ -524,6 +527,49 @@ scenario("pop-ups: disabled setting shows nothing", function()
     p:onSuspend() advance(60)
     check(not lastLogHas("[show]"), "nothing shown")
     p.settings.notify = true
+end)
+
+
+
+scenario("Sync now: exactly one summary pop-up, KOSync called silently", function()
+    local p = newReader()
+    p:onReaderReady() advance(30)
+    p:onPageUpdate(2)
+    local before = #log
+    p:onKOSyncWiFiSyncNow() advance(now + 40)
+    local shows = 0
+    for i = before + 1, #log do if log[i]:find("[show]", 1, true) then shows = shows + 1 end end
+    check(shows == 1, "one pop-up, got " .. shows)
+    check(lastLogHas("[show] Progress sync: pushed, pulled"), "it is the summary")
+    check(not lastLogHas("interactive=true"), "KOSync not called interactively")
+end)
+
+scenario("Sync now: no summary when KOSync's prompt is on screen", function()
+    local p = newReader()
+    p:onReaderReady() advance(30)
+    p:onPageUpdate(2)
+    local real_get = kosync.getProgress
+    kosync.getProgress = function(self, ensure, interactive)
+        say("  [kosync] getProgress prompt")
+        UIManager:show({ text = "Sync to latest location?" })
+    end
+    local before = #log
+    p:onKOSyncWiFiSyncNow() advance(now + 40)
+    kosync.getProgress = real_get
+    local shows = 0
+    for i = before + 1, #log do if log[i]:find("[show]", 1, true) then shows = shows + 1 end end
+    check(shows == 1, "only the prompt is on screen, got " .. shows)
+    check(not lastLogHas("[show] Progress sync:"), "summary suppressed")
+end)
+
+scenario("Sync now: no Wi-Fi gives one message", function()
+    local p = newReader()
+    wifi.never = true
+    local before = #log
+    p:onKOSyncWiFiSyncNow() advance(now + 60)
+    local shows = 0
+    for i = before + 1, #log do if log[i]:find("[show]", 1, true) then shows = shows + 1 end end
+    check(shows == 1 and lastLogHas("[show] Could not connect to Wi-Fi."), "single failure message")
 end)
 
 

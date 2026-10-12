@@ -609,6 +609,7 @@ function KOSyncWiFi:doSync(opts)
     local parts = {}
     local all_ok = true
     local pushed = false
+    local prompt_shown = false
     local sent, dropped = drainQueue()
     if sent and sent > 0 then
         table.insert(parts, T(_("%1 queued sent"), sent))
@@ -623,21 +624,29 @@ function KOSyncWiFi:doSync(opts)
     local kosync = self:getKOSync()
     if kosync and self:inReader() then
         if opts.push then
-            local ok, part = self:pushNow(opts.interactive)
+            -- Always KOSync's silent mode: its interactive mode shows its own
+            -- "Progress has been pushed." under ours.
+            local ok, part = self:pushNow(false)
             if part then table.insert(parts, part) end
             if not ok then all_ok = false end
             if ok and part == _("pushed") then pushed = true end
         end
         if opts.pull then
             kosync.pull_timestamp = 0
-            kosync:getProgress(false, opts.interactive)
+            -- Silent mode keeps the forward/backward prompt instead of jumping
+            -- blindly. If it put a prompt on screen, the caller must not cover it.
+            local top = UIManager.getTopmostVisibleWidget and UIManager:getTopmostVisibleWidget()
+            kosync:getProgress(false, false)
+            if UIManager.getTopmostVisibleWidget and UIManager:getTopmostVisibleWidget() ~= top then
+                prompt_shown = true
+            end
             table.insert(parts, _("pulled"))
         end
     end
     if #parts == 0 then
-        return _("nothing to do"), true, false
+        return _("nothing to do"), true, false, prompt_shown
     end
-    return table.concat(parts, ", "), all_ok, pushed
+    return table.concat(parts, ", "), all_ok, pushed, prompt_shown
 end
 
 -- Bring Wi-Fi up, sync, bring it down.
@@ -646,15 +655,21 @@ function KOSyncWiFi:runSync(kind, opts, on_finished)
     Link.request(self.settings, function(ok)
         if not ok then
             Link.setLast(kind, false, _("no Wi-Fi"))
-            if opts.interactive then
+            if opts.manual then
                 UIManager:show(InfoMessage:new{ text = _("Could not connect to Wi-Fi."), timeout = 3 })
             end
             return
         end
-        local summary, all_ok, pushed = self:doSync(opts)
+        local summary, all_ok, pushed, prompt_shown = self:doSync(opts)
         Link.setLast(kind, all_ok, summary)
         logger.info("KOSyncWiFi:", kind, "sync done:", summary)
-        if pushed and not opts.interactive then
+        if opts.manual then
+            -- One summary, and none at all when KOSync's "move to the new
+            -- location?" prompt is already on screen.
+            if not prompt_shown then
+                UIManager:show(InfoMessage:new{ text = T(_("Progress sync: %1"), summary), timeout = 3 })
+            end
+        elseif pushed then
             showPushed(self.settings, pushedText(summary))
         end
     end, on_finished)
@@ -910,11 +925,7 @@ function KOSyncWiFi:onKOSyncWiFiSyncNow()
             return true
         end
     end
-    self:runSync("manual", { push = true, pull = true, interactive = true }, function(ok)
-        if ok and Link.last then
-            UIManager:show(InfoMessage:new{ text = T(_("Progress sync: %1"), Link.last.detail), timeout = 3 })
-        end
-    end)
+    self:runSync("manual", { push = true, pull = true, manual = true })
     return true
 end
 
