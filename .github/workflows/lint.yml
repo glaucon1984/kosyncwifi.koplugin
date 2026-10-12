@@ -1,0 +1,28 @@
+name: Lua checks
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install LuaJIT
+        run: sudo apt-get update && sudo apt-get install -y luajit
+      - name: Check every Lua file compiles
+        run: |
+          set -e
+          for f in $(git ls-files '*.lua'); do
+            luajit -bl "$f" > /dev/null
+            echo "OK $f"
+          done
+      - name: Run the mock harness
+        run: luajit tests/harness.lua kosyncwifi.koplugin/main.lua
+      - name: Version in _meta.lua matches the tag (releases only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          meta=$(sed -n 's/.*version = "\([^"]*\)".*/\1/p' kosyncwifi.koplugin/_meta.lua)
+          test "$tag" = "$meta" || { echo "tag v$tag != _meta.lua version $meta"; exit 1; }

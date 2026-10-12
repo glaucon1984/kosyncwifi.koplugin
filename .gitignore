@@ -1,0 +1,5 @@
+# Release zip is built from the plugin folder and attached to GitHub releases
+*.zip
+*.sha256
+desktop.ini
+Thumbs.db
