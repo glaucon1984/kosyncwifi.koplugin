@@ -45,7 +45,13 @@ A *Sync now* entry and a dispatcher action (gestures / profiles) are provided.
 - **Connect silently** (default on). Off = KOReader's normal non-interactive
   connection, which shows its small "Scanning…" / "Connected" messages; use it
   if the silent script never connects on your device.
-- **Show a short notice after each sync.**
+- **Pop-up after a push** (default on). Shown only when progress actually
+  went to the server: after closing a book, after the sleep push, or when the
+  offline queue was sent. Nothing for pulls (KOReader asks before moving you
+  anyway), "in sync" or when another device is ahead.
+- **Also on the sleep screen** (default on). After the sleep push a small box
+  "Progress pushed at HH:MM" is drawn over the sleep screen and stays there
+  while the device sleeps; it is removed with a full refresh on wake-up.
 
 The status line at the top of the menu shows the last sync: when, which
 event, and what happened ("pushed", "pulled", "not pushed: in sync",

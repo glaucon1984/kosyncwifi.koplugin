@@ -14,7 +14,10 @@ function UIManager:scheduleIn(s, fn, ...) local args = {...}; table.insert(tasks
 function UIManager:nextTick(fn, ...) return self:scheduleIn(0, fn, ...) end
 function UIManager:unschedule(fn) local n = 0 for i = #tasks, 1, -1 do if tasks[i].fn == fn then table.remove(tasks, i) n = n + 1 end end return n > 0 end
 function UIManager:broadcastEvent(ev) say("  [event]", ev.name) end
-function UIManager:show(w) say("  [show]", w.text or "?") end
+function UIManager:show(w) say("  [show]" .. (w.modal and " (modal)" or ""), w.text or "?") end
+function UIManager:close(w) say("  [close]", w.text or "?") end
+function UIManager:forceRePaint() end
+function UIManager:setDirty(w, t) say("  [refresh]", t) end
 function UIManager:getElapsedTimeSinceBoot() return now end
 local function advance(to)
     while true do
@@ -446,6 +449,71 @@ scenario("page-turn time survives reopening the book", function()
     p2:onReaderReady() advance(30)
     check(p2:getLastPageTurn() == turn, "restored from doc settings")
     check(kosync.last_page_turn_timestamp == turn, "handed to the new KOSync instance")
+end)
+
+
+
+scenario("pop-ups: open/wake pulls show nothing", function()
+    local p = newReader()
+    p:onReaderReady() advance(30)
+    check(not lastLogHas("[show]"), "no pop-up on open")
+    p:onResume() advance(30)
+    check(not lastLogHas("[show]"), "no pop-up on wake")
+end)
+
+scenario("pop-ups: sleep push draws a modal box on the sleep screen, wake removes it", function()
+    local p = newReader()
+    p:onReaderReady() advance(30)
+    p:onPageUpdate(2)
+    Device.screen_saver_mode = true
+    p:onSuspend() advance(60)
+    check(lastLogHas("[show] (modal) Progress pushed at"), "modal box shown on the sleep screen")
+    Device.screen_saver_mode = false
+    p:onResume()
+    check(lastLogHas("[close] Progress pushed at"), "box closed on wake")
+    check(lastLogHas("[refresh] full"), "full refresh after removing it")
+    advance(30)
+end)
+
+scenario("pop-ups: sleep push with nothing new shows nothing", function()
+    local p = newReader()
+    p:onReaderReady() advance(30)
+    p:onPageUpdate(2)
+    server.digest1 = { timestamp = os.time() - 100, device_id = "X3", device = "Xteink", progress = "/body/x", percentage = 0.5 }
+    Device.screen_saver_mode = true
+    p:onSuspend() advance(60)
+    check(not lastLogHas("[show]"), "no box for 'in sync'")
+end)
+
+scenario("pop-ups: online close push shows a pop-up above the file manager", function()
+    local p = newReader()
+    p:onReaderReady() advance(30)
+    p:onPageUpdate(2)
+    wifi.modules = true wifi.address = true wifi.route = true
+    p:onCloseDocument()
+    check(not lastLogHas("[show] Progress pushed."), "not shown synchronously during close")
+    advance(now + 2)
+    check(lastLogHas("[show] Progress pushed."), "shown shortly after")
+end)
+
+scenario("pop-ups: offline close, queue sent later, pop-up then", function()
+    local p = newReader()
+    p:onReaderReady() advance(30)
+    p:onPageUpdate(2)
+    p:onCloseDocument()
+    advance(40)
+    check(lastLogHas("[show] Progress pushed."), "pop-up after the background send")
+end)
+
+scenario("pop-ups: disabled setting shows nothing", function()
+    local p = newReader()
+    p.settings.notify = false
+    p:onReaderReady() advance(30)
+    p:onPageUpdate(2)
+    Device.screen_saver_mode = true
+    p:onSuspend() advance(60)
+    check(not lastLogHas("[show]"), "nothing shown")
+    p.settings.notify = true
 end)
 
 

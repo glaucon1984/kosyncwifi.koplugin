@@ -27,7 +27,7 @@ local Event = require("ui/event")
 local InfoMessage = require("ui/widget/infomessage")
 local LuaSettings = require("luasettings")
 local NetworkMgr = require("ui/network/manager")
-local Notification = require("ui/widget/notification")
+
 local UIManager = require("ui/uimanager")
 local WidgetContainer = require("ui/widget/container/widgetcontainer")
 local lfs = require("libs/libkoreader-lfs")
@@ -49,7 +49,10 @@ local DEFAULTS = {
     -- "standard": NetworkMgr:enableWifi (non-interactive, shows KOReader's small
     -- "Scanning…" / "Connected to network" messages).
     method = "silent",
+    -- Pop-up after a push went out (never for pulls, "in sync" or "ahead").
     notify = true,
+    -- Also draw it on the sleep screen after the sleep push (cleared on wake).
+    notify_on_sleep_screen = true,
 }
 
 -- Extra seconds on top of connect_timeout that the suspend is pushed out by,
@@ -523,10 +526,15 @@ function KOSyncWiFi:getKOSync()
     end
 end
 
-function KOSyncWiFi:notify(text)
-    if self.settings.notify then
-        Notification:notify(text)
-    end
+-- Pop-up after a push went out. Independent of any plugin instance so it can
+-- be scheduled from a closing reader.
+local function showPushed(settings, text)
+    if not settings.notify then return end
+    UIManager:show(InfoMessage:new{ text = text, timeout = 3 })
+end
+
+local function pushedText(summary)
+    return T(_("Progress pushed (%1)."), summary)
 end
 
 -- ---- reading-time tracking --------------------------------------------------
@@ -587,14 +595,16 @@ function KOSyncWiFi:pushNow(interactive)
     return true, _("pushed")
 end
 
--- The sync work itself, run while Wi-Fi is up. Returns a one-line summary and
--- whether everything went through.
+-- The sync work itself, run while Wi-Fi is up. Returns a one-line summary,
+-- whether everything went through, and whether anything was actually pushed.
 function KOSyncWiFi:doSync(opts)
     local parts = {}
     local all_ok = true
+    local pushed = false
     local sent, dropped = drainQueue()
     if sent and sent > 0 then
         table.insert(parts, T(_("%1 queued sent"), sent))
+        pushed = true
     end
     if dropped and dropped > 0 then
         table.insert(parts, T(_("%1 queued dropped"), dropped))
@@ -608,6 +618,7 @@ function KOSyncWiFi:doSync(opts)
             local ok, part = self:pushNow(opts.interactive)
             if part then table.insert(parts, part) end
             if not ok then all_ok = false end
+            if ok and part == _("pushed") then pushed = true end
         end
         if opts.pull then
             kosync.pull_timestamp = 0
@@ -616,9 +627,9 @@ function KOSyncWiFi:doSync(opts)
         end
     end
     if #parts == 0 then
-        return _("nothing to do"), true
+        return _("nothing to do"), true, false
     end
-    return table.concat(parts, ", "), all_ok
+    return table.concat(parts, ", "), all_ok, pushed
 end
 
 -- Bring Wi-Fi up, sync, bring it down.
@@ -632,11 +643,11 @@ function KOSyncWiFi:runSync(kind, opts, on_finished)
             end
             return
         end
-        local summary, all_ok = self:doSync(opts)
+        local summary, all_ok, pushed = self:doSync(opts)
         Link.setLast(kind, all_ok, summary)
         logger.info("KOSyncWiFi:", kind, "sync done:", summary)
-        if opts.notify ~= false and not opts.interactive then
-            self:notify(T(_("Progress sync: %1"), summary))
+        if pushed and not opts.interactive then
+            showPushed(self.settings, pushedText(summary))
         end
     end, on_finished)
 end
@@ -682,6 +693,11 @@ function KOSyncWiFi:onCloseDocument()
         logger.info("KOSyncWiFi: sync requested: close (online)")
         local ok, part = self:pushNow(false)
         Link.setLast("close", ok, part or _("nothing to do"))
+        if ok and part == _("pushed") then
+            -- The file manager is about to be shown; put the pop-up above it.
+            local settings = self.settings
+            UIManager:scheduleIn(0.5, function() showPushed(settings, _("Progress pushed.")) end)
+        end
         return
     end
 
@@ -717,7 +733,6 @@ function KOSyncWiFi:onCloseDocument()
 
     local creds = loadKOSyncCreds()
     local settings = self.settings
-    local notify = settings.notify
     Link.request(settings, function(up)
         if not up then
             Link.setLast("close", false, _("no Wi-Fi, queued"))
@@ -731,8 +746,8 @@ function KOSyncWiFi:onCloseDocument()
         end
         Link.setLast("close", queueCount() == 0, summary)
         logger.info("KOSyncWiFi: close sync done:", summary)
-        if notify then
-            Notification:notify(T(_("Progress sync: %1"), summary))
+        if sent > 0 then
+            showPushed(settings, _("Progress pushed."))
         end
     end)
 end
@@ -763,11 +778,15 @@ function KOSyncWiFi:onSuspend()
             end
             -- If we were woken up meanwhile, also pull (acts as the wake sync).
             local awake = self.suspend_token ~= token
-            local summary, all_ok = self:doSync({ push = true, pull = awake })
+            local summary, all_ok, pushed = self:doSync({ push = true, pull = awake })
             Link.setLast("sleep", all_ok, summary)
             logger.info("KOSyncWiFi: sleep sync done:", summary)
-            if awake then
-                self:notify(T(_("Progress sync: %1"), summary))
+            if pushed then
+                if awake or not Device.screen_saver_mode then
+                    showPushed(self.settings, pushedText(summary))
+                else
+                    self:showOnSleepScreen(T(_("Progress pushed at %1."), os.date("%H:%M")))
+                end
             end
         end, function()
             if self.suspend_token == token then
@@ -781,7 +800,28 @@ function KOSyncWiFi:onSuspend()
     end)
 end
 
+-- A box over the sleep screen, left there while the device sleeps. It has to
+-- be modal: UIManager slips non-modal widgets *below* the (modal) screensaver.
+function KOSyncWiFi:showOnSleepScreen(text)
+    if not self.settings.notify or not self.settings.notify_on_sleep_screen then return end
+    self:clearSleepScreenBox(false)
+    self.sleep_box = InfoMessage:new{ text = text, modal = true }
+    UIManager:show(self.sleep_box)
+    UIManager:forceRePaint()
+end
+
+function KOSyncWiFi:clearSleepScreenBox(refresh)
+    if not self.sleep_box then return end
+    UIManager:close(self.sleep_box)
+    self.sleep_box = nil
+    if refresh then
+        -- Full flash: the box sat on the e-ink panel for a long time.
+        UIManager:setDirty(nil, "full")
+    end
+end
+
 function KOSyncWiFi:onResume()
+    self:clearSleepScreenBox(true)
     local suspend_job_pending = self.suspend_token ~= nil and Link.job ~= nil
     self.suspend_token = nil
     if not self.settings.enabled or not self.settings.on_resume then return end
@@ -925,7 +965,18 @@ function KOSyncWiFi:addToMainMenu(menu_items)
                     self:saveSettings()
                 end,
             },
-            self:toggleEntry("notify", _("Show a short notice after each sync")),
+            self:toggleEntry("notify", _("Pop-up after a push"),
+                _("Shown when progress actually went to the server: on close, on sleep, or from the queue. Nothing for pulls, 'in sync' or when another device is ahead.")),
+            {
+                text = _("Also on the sleep screen"),
+                help_text = _("After the sleep push, a small box with the time is drawn over the sleep screen and removed on wake-up."),
+                enabled_func = function() return self.settings.enabled and self.settings.notify end,
+                checked_func = function() return self.settings.notify_on_sleep_screen end,
+                callback = function()
+                    self.settings.notify_on_sleep_screen = not self.settings.notify_on_sleep_screen
+                    self:saveSettings()
+                end,
+            },
         },
     }
 end
