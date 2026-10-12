@@ -49,9 +49,11 @@ A *Sync now* entry and a dispatcher action (gestures / profiles) are provided.
   went to the server: after closing a book, after the sleep push, or when the
   offline queue was sent. Nothing for pulls (KOReader asks before moving you
   anyway), "in sync" or when another device is ahead.
-- **Also on the sleep screen** (default on). After the sleep push a small box
-  "Progress pushed at HH:MM" is drawn over the sleep screen and stays there
-  while the device sleeps; it is removed with a full refresh on wake-up.
+- **Also on the sleep screen** (default on). After the sleep push a small
+  square box in a serif face, "Progress pushed at HH:MM", is drawn near the
+  bottom edge of the sleep screen and stays there while the device sleeps; it
+  is removed with a full refresh on wake-up. **Sleep screen box position**:
+  bottom centred, bottom left or bottom right corner.
 
 The status line at the top of the menu shows the last sync: when, which
 event, and what happened ("pushed", "pulled", "not pushed: in sync",

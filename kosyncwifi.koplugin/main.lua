@@ -20,11 +20,17 @@ account and the forward/backward prompt settings, and owns the offline queue.
 @module koplugin.kosyncwifi
 --]]--
 
+local Blitbuffer = require("ffi/blitbuffer")
 local DataStorage = require("datastorage")
 local Device = require("device")
 local Dispatcher = require("dispatcher")
 local Event = require("ui/event")
+local Font = require("ui/font")
+local FrameContainer = require("ui/widget/container/framecontainer")
+local Geom = require("ui/geometry")
 local InfoMessage = require("ui/widget/infomessage")
+local Size = require("ui/size")
+local TextWidget = require("ui/widget/textwidget")
 local LuaSettings = require("luasettings")
 local NetworkMgr = require("ui/network/manager")
 
@@ -53,6 +59,8 @@ local DEFAULTS = {
     notify = true,
     -- Also draw it on the sleep screen after the sleep push (cleared on wake).
     notify_on_sleep_screen = true,
+    -- Where the sleep-screen box goes: "bottom", "bottom_left", "bottom_right".
+    sleep_box_position = "bottom",
 }
 
 -- Extra seconds on top of connect_timeout that the suspend is pushed out by,
@@ -800,12 +808,66 @@ function KOSyncWiFi:onSuspend()
     end)
 end
 
--- A box over the sleep screen, left there while the device sleeps. It has to
--- be modal: UIManager slips non-modal widgets *below* the (modal) screensaver.
+-- The box drawn over the sleep screen: a plain square frame, serif text,
+-- near the bottom edge. Deliberately not an InfoMessage (no rounded window,
+-- no icon, not centred). It has to be modal: UIManager slips non-modal
+-- widgets *below* the (modal) screensaver widget.
+local SleepBox = WidgetContainer:extend{
+    modal = true,
+    text = "",
+    position = "bottom", -- "bottom" (centred), "bottom_left", "bottom_right"
+}
+
+function SleepBox:init()
+    local Screen = Device.screen
+    local edge = Screen:scaleBySize(18)
+    local face = Font:getFace("NotoSerif-Regular.ttf", 15) or Font:getFace("infofont")
+    local text_widget = TextWidget:new{
+        text = self.text,
+        face = face,
+        max_width = Screen:getWidth() - 2 * edge - 2 * Size.padding.large,
+    }
+    self.frame = FrameContainer:new{
+        background = Blitbuffer.COLOR_WHITE,
+        color = Blitbuffer.COLOR_BLACK,
+        bordersize = Size.border.default,
+        radius = 0,
+        margin = 0,
+        padding = Size.padding.default,
+        padding_left = Size.padding.large,
+        padding_right = Size.padding.large,
+        text_widget,
+    }
+    local size = self.frame:getSize()
+    local x
+    if self.position == "bottom_left" then
+        x = edge
+    elseif self.position == "bottom_right" then
+        x = Screen:getWidth() - size.w - edge
+    else
+        x = math.floor((Screen:getWidth() - size.w) / 2)
+    end
+    local y = Screen:getHeight() - size.h - edge
+    self.dimen = Geom:new{ x = x, y = y, w = size.w, h = size.h }
+    self[1] = self.frame
+end
+
+function SleepBox:getSize()
+    return self.dimen
+end
+
+function SleepBox:onShow()
+    UIManager:setDirty(self, function() return "ui", self.dimen end)
+end
+
+function SleepBox:onCloseWidget()
+    UIManager:setDirty(nil, function() return "ui", self.dimen end)
+end
+
 function KOSyncWiFi:showOnSleepScreen(text)
     if not self.settings.notify or not self.settings.notify_on_sleep_screen then return end
     self:clearSleepScreenBox(false)
-    self.sleep_box = InfoMessage:new{ text = text, modal = true }
+    self.sleep_box = SleepBox:new{ text = text, position = self.settings.sleep_box_position }
     UIManager:show(self.sleep_box)
     UIManager:forceRePaint()
 end
@@ -897,6 +959,18 @@ function KOSyncWiFi:toggleEntry(key, text, help)
     }
 end
 
+function KOSyncWiFi:positionEntry(value, text)
+    return {
+        text = text,
+        radio = true,
+        checked_func = function() return self.settings.sleep_box_position == value end,
+        callback = function()
+            self.settings.sleep_box_position = value
+            self:saveSettings()
+        end,
+    }
+end
+
 function KOSyncWiFi:addToMainMenu(menu_items)
     menu_items.kosyncwifi = {
         text = _("Progress sync: Wi-Fi on demand"),
@@ -976,6 +1050,15 @@ function KOSyncWiFi:addToMainMenu(menu_items)
                     self.settings.notify_on_sleep_screen = not self.settings.notify_on_sleep_screen
                     self:saveSettings()
                 end,
+            },
+            {
+                text = _("Sleep screen box position"),
+                enabled_func = function() return self.settings.enabled and self.settings.notify and self.settings.notify_on_sleep_screen end,
+                sub_item_table = {
+                    self:positionEntry("bottom", _("Bottom, centred")),
+                    self:positionEntry("bottom_left", _("Bottom left corner")),
+                    self:positionEntry("bottom_right", _("Bottom right corner")),
+                },
             },
         },
     }

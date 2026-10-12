@@ -80,7 +80,8 @@ end
 function NetworkMgr:enableWifi() error("standard method not expected in this harness") end
 
 -- ---- fake Device -------------------------------------------------------------
-local Device = { screen_saver_mode = false, model = "Kobo_clarabw", suspend_calls = {} }
+local Device = { screen_saver_mode = false, model = "Kobo_clarabw", suspend_calls = {},
+    screen = { getWidth = function() return 1072 end, getHeight = function() return 1448 end, scaleBySize = function(_, v) return v * 2 end } }
 function Device:hasWifiRestore() return true end
 function Device:rescheduleSuspend(t) say("  [device] rescheduleSuspend", t) table.insert(self.suspend_calls, t) end
 
@@ -151,6 +152,12 @@ local stubs = {
     ["ffi/util"] = { template = function(s, ...) local a = {...} return (s:gsub("%%(%d)", function(i) return tostring(a[tonumber(i)]) end)) end },
     ["gettext"] = function(s) return s end,
     ["ui/widget/spinwidget"] = { new = function(_, o) return o end },
+    ["ffi/blitbuffer"] = { COLOR_WHITE = "white", COLOR_BLACK = "black" },
+    ["ui/font"] = { getFace = function(_, name, size) return { name = name, size = size } end },
+    ["ui/geometry"] = { new = function(_, o) return o end },
+    ["ui/size"] = { border = { default = 2, thin = 1 }, padding = { default = 10, large = 20 } },
+    ["ui/widget/textwidget"] = { new = function(_, o) o.getSize = function() return { w = 300, h = 40 } end return o end },
+    ["ui/widget/container/framecontainer"] = { new = function(_, o) o.getSize = function() return { w = 300 + 2 * 20 + 4, h = 40 + 2 * 10 + 4 } end return o end },
     ["KOSyncQueue"] = KOSyncQueue,
     ["KOSyncClient"] = KOSyncClient,
 }
@@ -468,6 +475,9 @@ scenario("pop-ups: sleep push draws a modal box on the sleep screen, wake remove
     Device.screen_saver_mode = true
     p:onSuspend() advance(60)
     check(lastLogHas("[show] (modal) Progress pushed at"), "modal box shown on the sleep screen")
+    local d = p.sleep_box and p.sleep_box.dimen
+    check(d and d.y == 1448 - 64 - 36 and d.x == math.floor((1072 - 344) / 2), "box sits centred near the bottom edge")
+    check(p.sleep_box.frame.radius == 0 and p.sleep_box.frame[1].face.name == "NotoSerif-Regular.ttf", "square frame, serif face")
     Device.screen_saver_mode = false
     p:onResume()
     check(lastLogHas("[close] Progress pushed at"), "box closed on wake")
