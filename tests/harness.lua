@@ -129,6 +129,9 @@ local function resetKOSync()
         if interactive then say("  [kosync] updateProgress interactive=true") end
         if push_fails then say("  [kosync] updateProgress FAILED -> queued") KOSyncQueue:push({ document = "digest1", device_id = "DEV" }) return end
         say("  [kosync] updateProgress route=" .. tostring(wifi.route))
+        -- the server now holds our position, stamped with the push time
+        server[self:getDocumentDigest()] = { device_id = self.device_id, device = "Kobo Clara BW",
+            progress = self:getLastProgress(), percentage = self:getLastPercent(), timestamp = os.time() }
     end
     function kosync:getProgress() say("  [kosync] getProgress route=" .. tostring(wifi.route)) end
     function kosync:getDocumentDigest() return "digest1" end
@@ -199,6 +202,7 @@ end
 
 scenario("open a book: pull only once DHCP is done, then Wi-Fi off", function()
     local p = newReader()
+    server.digest1 = { timestamp = os.time() + 10, device_id = "X3", device = "Xteink", progress = "/body/new", percentage = 0.7 }
     p:onReaderReady()
     advance(30)
     check(lastLogHas("getProgress route=true"), "pull ran with a default route")
@@ -231,7 +235,7 @@ scenario("sleep, but woken up before Wi-Fi came up", function()
     p:onResume()
     advance(60)
     check(#Device.suspend_calls == 1, "suspend not re-armed after wake")
-    check(lastLogHas("getProgress route=true"), "converted job also pulled")
+    check(lastLogHas("not pulling: latest progress is this device's own"), "converted job checked the server for a pull")
     check(not wifi.modules, "wifi off after the converted job")
 end)
 
@@ -303,6 +307,7 @@ end)
 
 scenario("wake: Bluetooth plugin has Wi-Fi borrowed, we wait for it", function()
     local p = newReader()
+    server.digest1 = { timestamp = os.time() + 10, device_id = "X3", device = "Xteink", progress = "/body/new", percentage = 0.7 }
     package.loaded["src/kobo_bluetooth"] = { wifi_borrowed = true }
     UIManager:scheduleIn(2.5, function() package.loaded["src/kobo_bluetooth"].wifi_borrowed = false end)
     local started_at
@@ -319,6 +324,7 @@ end)
 
 scenario("wake: a foreign script that fails is waited out, then we connect", function()
     local p = newReader()
+    server.digest1 = { timestamp = os.time() + 10, device_id = "X3", device = "Xteink", progress = "/body/new", percentage = 0.7 }
     wifi.never = true
     startScript("other")           -- doomed foreign script (gives up at 15 s)
     wifi.never = false
@@ -331,6 +337,7 @@ end)
 
 scenario("wake: another script finishes normally and leaves Wi-Fi on", function()
     local p = newReader()
+    server.digest1 = { timestamp = os.time() + 10, device_id = "X3", device = "Xteink", progress = "/body/new", percentage = 0.7 }
     startScript("other")
     p:onResume()
     advance(30)
@@ -540,7 +547,7 @@ scenario("Sync now: exactly one summary pop-up, KOSync called silently", functio
     local shows = 0
     for i = before + 1, #log do if log[i]:find("[show]", 1, true) then shows = shows + 1 end end
     check(shows == 1, "one pop-up, got " .. shows)
-    check(lastLogHas("[show] Progress sync: pushed, pulled"), "it is the summary")
+    check(lastLogHas("[show] Progress sync: pushed"), "it is the summary")
     check(not lastLogHas("interactive=true"), "KOSync not called interactively")
 end)
 
@@ -549,6 +556,9 @@ scenario("Sync now: no summary when KOSync's prompt is on screen", function()
     p:onReaderReady() advance(30)
     p:onPageUpdate(2)
     local real_get = kosync.getProgress
+    local real_update = kosync.updateProgress
+    kosync.updateProgress = function() say("  [kosync] updateProgress (server untouched)") end
+    server.digest1 = { timestamp = os.time() + 10, device_id = "X3", device = "Xteink", progress = "/body/new", percentage = 0.7 }
     kosync.getProgress = function(self, ensure, interactive)
         say("  [kosync] getProgress prompt")
         UIManager:show({ text = "Sync to latest location?" })
@@ -556,6 +566,7 @@ scenario("Sync now: no summary when KOSync's prompt is on screen", function()
     local before = #log
     p:onKOSyncWiFiSyncNow() advance(now + 40)
     kosync.getProgress = real_get
+    kosync.updateProgress = real_update
     local shows = 0
     for i = before + 1, #log do if log[i]:find("[show]", 1, true) then shows = shows + 1 end end
     check(shows == 1, "only the prompt is on screen, got " .. shows)
@@ -570,6 +581,45 @@ scenario("Sync now: no Wi-Fi gives one message", function()
     local shows = 0
     for i = before + 1, #log do if log[i]:find("[show]", 1, true) then shows = shows + 1 end end
     check(shows == 1 and lastLogHas("[show] Could not connect to Wi-Fi."), "single failure message")
+end)
+
+
+
+scenario("wake after our own sleep push: no pull, no prompt", function()
+    local p = newReader()
+    p:onReaderReady() advance(30)
+    p:onPageUpdate(2)
+    Device.screen_saver_mode = true
+    p:onSuspend() advance(60)
+    check(Link.last and Link.last.detail == "pushed", "sleep push went out")
+    local before = #log
+    Device.screen_saver_mode = false
+    p:onResume() advance(now + 40)
+    local pulled = false
+    for i = before + 1, #log do if log[i]:find("[kosync] getProgress", 1, true) then pulled = true end end
+    check(not pulled, "KOSync's pull was not called for our own progress")
+    check(lastLogHas("not pulling: latest progress is this device's own"), "reason logged")
+    check(Link.last and Link.last.detail == "latest is ours", "status: " .. tostring(Link.last and Link.last.detail))
+end)
+
+scenario("wake when another device moved on: KOSync pull runs (prompt path)", function()
+    local p = newReader()
+    p:onReaderReady() advance(30)
+    server.digest1 = { timestamp = os.time() + 10, device_id = "X3", device = "Xteink", progress = "/body/new", percentage = 0.7 }
+    p:onResume() advance(now + 40)
+    check(lastLogHas("[kosync] getProgress route=true"), "KOSync pull called")
+end)
+
+scenario("wake when the server already has the current position: in sync, no pull", function()
+    local p = newReader()
+    p:onReaderReady() advance(30)
+    server.digest1 = { timestamp = os.time() + 10, device_id = "X3", device = "Xteink", progress = "/body/x", percentage = 0.5 }
+    local before = #log
+    p:onResume() advance(now + 40)
+    local pulled = false
+    for i = before + 1, #log do if log[i]:find("[kosync] getProgress", 1, true) then pulled = true end end
+    check(not pulled, "no pull")
+    check(Link.last and Link.last.detail == "in sync", "status in sync")
 end)
 
 

@@ -82,6 +82,14 @@ event, and what happened ("pushed", "pulled", "not pushed: in sync",
   server is asked for its position first. Nothing is pushed when the server
   already has this position, when no page was turned here, or when another
   device pushed after the last page turn here.
+- **A pull never offers you your own push.** KOSync's "latest progress is
+  coming from this device" check compares the device *name* on the server
+  with KOReader's internal model name, which fails as soon as you give the
+  device a custom name in Progress sync's settings; KOSync then offers to
+  "sync forward" to the position this device sent a minute ago. The plugin
+  asks the server before every pull and skips KOSync's pull when the latest
+  progress is this device's own (by device id) or already the current
+  position.
 - **USB storage, power off, reboot, exit.** The "Close" / "Exit" broadcasts
   abort any running Wi-Fi job and stop the background script, which runs from
   the onboard partition and would otherwise block the USB export.

@@ -603,6 +603,41 @@ function KOSyncWiFi:pushNow(interactive)
     return true, _("pushed")
 end
 
+-- Pull through KOSync, unless the server's latest progress is this device's
+-- own or already the current position. KOSync's own "coming from this
+-- device" check compares the device *name* with the internal model name,
+-- which fails as soon as a custom device name is set in its settings; it
+-- then offers to "sync forward" to the position this device just pushed.
+-- Returns a summary part and whether KOSync put a prompt on screen.
+function KOSyncWiFi:pullNow()
+    local kosync = self:getKOSync()
+    if not kosync then return _("nothing to pull"), false end
+    local digest = kosync:getDocumentDigest()
+    local creds = loadKOSyncCreds()
+    if digest and creds then
+        local state, server = fetchServerProgress(newClient(creds), creds, digest)
+        if state == "none" then
+            return _("nothing on the server"), false
+        elseif state == "ok" then
+            if server.device_id == kosync.device_id then
+                logger.info("KOSyncWiFi: not pulling: latest progress is this device's own")
+                return _("latest is ours"), false
+            end
+            if samePosition(kosync:getLastProgress(), kosync:getLastPercent(), server.progress, server.percentage) then
+                logger.info("KOSyncWiFi: not pulling: in sync")
+                return _("in sync"), false
+            end
+        end
+    end
+    kosync.pull_timestamp = 0
+    -- Silent mode keeps the forward/backward prompt instead of jumping
+    -- blindly. If it put a prompt on screen, the caller must not cover it.
+    local top = UIManager.getTopmostVisibleWidget and UIManager:getTopmostVisibleWidget()
+    kosync:getProgress(false, false)
+    local prompted = UIManager.getTopmostVisibleWidget ~= nil and UIManager:getTopmostVisibleWidget() ~= top
+    return _("pulled"), prompted
+end
+
 -- The sync work itself, run while Wi-Fi is up. Returns a one-line summary,
 -- whether everything went through, and whether anything was actually pushed.
 function KOSyncWiFi:doSync(opts)
@@ -632,15 +667,12 @@ function KOSyncWiFi:doSync(opts)
             if ok and part == _("pushed") then pushed = true end
         end
         if opts.pull then
-            kosync.pull_timestamp = 0
-            -- Silent mode keeps the forward/backward prompt instead of jumping
-            -- blindly. If it put a prompt on screen, the caller must not cover it.
-            local top = UIManager.getTopmostVisibleWidget and UIManager:getTopmostVisibleWidget()
-            kosync:getProgress(false, false)
-            if UIManager.getTopmostVisibleWidget and UIManager:getTopmostVisibleWidget() ~= top then
-                prompt_shown = true
+            local part, prompted = self:pullNow()
+            -- Right after our own push the server's latest is ours: not news.
+            if not (pushed and part == _("latest is ours")) then
+                table.insert(parts, part)
             end
-            table.insert(parts, _("pulled"))
+            if prompted then prompt_shown = true end
         end
     end
     if #parts == 0 then
