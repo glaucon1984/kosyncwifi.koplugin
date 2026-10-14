@@ -664,6 +664,18 @@ scenario("menu: entry goes inside Progress sync, both toggles grey each other ou
 end)
 
 
+
+scenario("launch(): same as Sync now, for other plugins' action pickers", function()
+    local p = newReader()
+    p:onReaderReady() advance(30)
+    p:onPageUpdate(2)
+    local before = #log
+    p:launch() advance(now + 40)
+    check(lastLogHas("sync requested: manual"), "launch runs the manual sync")
+    check(lastLogHas("[show] Progress sync: pushed"), "with its summary")
+end)
+
+
 print(table.concat(log, "\n"))
 print(failures == 0 and "\nALL SCENARIOS PASSED" or ("\n" .. failures .. " CHECK(S) FAILED"))
 os.exit(failures == 0 and 0 or 1)

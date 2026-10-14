@@ -41,7 +41,10 @@ out while the other is on; tapping the greyed item shows why. Opening
 *Wi-Fi on demand sync* while Progress sync's automatic sync is on shows a
 pop-up explaining why everything in it is off, and its first line says so too.
 
-A *Sync now* entry and a dispatcher action (gestures / profiles) are provided.
+A *Sync now* entry and a dispatcher action, "Sync now (Progress sync over
+Wi-Fi)", for gestures, profiles and other plugins' action pickers (for
+example SimpleUI's quick actions, under *System actions*; it also appears
+under *Plugin* there through the plugin's `launch` method) are provided.
 Sync now pushes and pulls and shows one summary line; when KOSync asks whether
 to move to the newer location, the summary is skipped so nothing overlaps.
 

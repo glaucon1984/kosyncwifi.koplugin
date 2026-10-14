@@ -517,9 +517,15 @@ function KOSyncWiFi:onDispatcherRegisterActions()
     Dispatcher:registerAction("kosyncwifi_sync_now", {
         category = "none",
         event = "KOSyncWiFiSyncNow",
-        title = _("Progress sync over Wi-Fi now"),
+        title = _("Sync now (Progress sync over Wi-Fi)"),
         general = true,
     })
+end
+
+-- Generic entry point other plugins can call (SimpleUI's quick-action picker
+-- looks for a `launch` method on file-manager plugins): same as "Sync now".
+function KOSyncWiFi:launch()
+    return self:onKOSyncWiFiSyncNow()
 end
 
 function KOSyncWiFi:inReader()
