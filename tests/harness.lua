@@ -209,7 +209,7 @@ scenario("open a book: pull only once DHCP is done, then Wi-Fi off", function()
     check(not wifi.modules, "wifi is off at the end")
     check(not NetworkMgr.pending_connection, "no pending connection left")
     check(gsettings.wifi_was_on == true, "wifi_was_on restored to prior value")
-    local items = {} p:addToMainMenu(items) check(items.kosyncwifi and #items.kosyncwifi.sub_item_table > 5, "menu builds")
+    local items = {} p:addToMainMenu(items) check(items.kosyncwifi and #items.kosyncwifi.sub_item_table > 5, "menu builds (Tools fallback)")
     check(items.kosyncwifi.sub_item_table[1].text_func():find("open"), "status: " .. items.kosyncwifi.sub_item_table[1].text_func())
 end)
 
@@ -620,6 +620,35 @@ scenario("wake when the server already has the current position: in sync, no pul
     for i = before + 1, #log do if log[i]:find("[kosync] getProgress", 1, true) then pulled = true end end
     check(not pulled, "no pull")
     check(Link.last and Link.last.detail == "in sync", "status in sync")
+end)
+
+
+
+scenario("menu: entry goes inside Progress sync, both toggles grey each other out", function()
+    local p = newReader()
+    local auto = { text = "Automatically keep documents in sync", help_text = "KOSync help", checked_func = function() return kosync.settings.auto_sync end }
+    local pages = { text_func = function() return "Sync every 10 pages" end, separator = true }
+    local behaviour = { text = "Sync behavior" }
+    local items = { progress_sync = { text = "Progress sync", sub_item_table = { { text = "Custom sync server" }, auto, pages, behaviour } } }
+    p:addToMainMenu(items)
+    local list = items.progress_sync.sub_item_table
+    check(items.kosyncwifi == nil, "no Tools entry in the reader")
+    check(list[4].text == "Wi-Fi on demand sync" and list[5] == behaviour, "inserted after the pages item, before Sync behavior")
+    check(pages.separator == nil and list[4].separator == true, "separator moved to our entry")
+    -- ours on -> KOSync's toggle greyed with a reason
+    check(auto.enabled_func() == false, "KOSync toggle disabled while ours is on")
+    check(auto.help_text_func():find("Wi%-Fi on demand sync"), "its help text says why")
+    -- ours off -> KOSync's toggle back, original help
+    p.settings.enabled = false
+    check(auto.enabled_func() == true and auto.help_text_func() == "KOSync help", "KOSync toggle back with its own help")
+    -- KOSync auto on -> our Enable greyed with a reason
+    kosync.settings.auto_sync = true
+    local enable = list[4].sub_item_table[2]
+    check(enable.text == "Enable" and enable.enabled_func() == false, "our Enable disabled while KOSync auto is on")
+    check(enable.help_text_func():find("Automatically keep documents in sync"), "its help text says why")
+    kosync.settings.auto_sync = false
+    check(enable.enabled_func() == true, "our Enable back")
+    p.settings.enabled = true
 end)
 
 

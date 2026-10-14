@@ -31,7 +31,13 @@ the plugin switches it off if it finds it on.
    [latest release](https://github.com/glaucon1984/kosyncwifi.koplugin/releases/latest)
    and unzip it into `koreader/plugins/` on the device, so that
    `koreader/plugins/kosyncwifi.koplugin/main.lua` exists.
-3. Restart KOReader. The menu is under Tools → *Progress sync: Wi-Fi on demand*.
+3. Restart KOReader. With a book open, the entry *Wi-Fi on demand sync* is
+   inside Progress sync's own menu, right after its "Automatically keep
+   documents in sync" item (in the file manager it is under Tools →
+   *Progress sync: Wi-Fi on demand*).
+
+The two automatic modes exclude each other, so each one's toggle is greyed
+out while the other is on; tapping the greyed item shows why.
 
 A *Sync now* entry and a dispatcher action (gestures / profiles) are provided.
 Sync now pushes and pulls and shows one summary line; when KOSync asks whether

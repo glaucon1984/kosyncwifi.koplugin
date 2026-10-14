@@ -1014,97 +1014,170 @@ function KOSyncWiFi:positionEntry(value, text)
     }
 end
 
-function KOSyncWiFi:addToMainMenu(menu_items)
-    menu_items.kosyncwifi = {
-        text = _("Progress sync: Wi-Fi on demand"),
-        sorting_hint = "tools",
-        sub_item_table = {
-            {
-                text_func = statusText,
-                enabled = false,
-                separator = true,
-            },
-            self:toggleEntry("enabled", _("Enable"),
-                _("Run Progress sync automatically and turn Wi-Fi on only for the sync. Progress sync's own 'Automatic sync' must stay off.")),
-            {
-                text = _("Sync now"),
-                enabled_func = function() return self.settings.enabled end,
-                callback = function() self:onKOSyncWiFiSyncNow() end,
-                separator = true,
-            },
-            self:toggleEntry("on_open", _("Pull when opening a book")),
-            self:toggleEntry("on_resume", _("Pull on wake-up")),
-            self:toggleEntry("on_suspend", _("Push on sleep"),
-                _("Keeps the device awake (sleep screen already showing) until the push is done or the time limit is reached.")),
-            self:toggleEntry("on_close", _("Push when closing a book")),
-            {
-                text = _("Turn Wi-Fi off afterwards"),
-                help_text = _("Only when the plugin turned it on. Wi-Fi that was already on is left alone."),
-                enabled_func = function() return self.settings.enabled end,
-                checked_func = function() return self.settings.wifi_off_after end,
-                callback = function()
-                    self.settings.wifi_off_after = not self.settings.wifi_off_after
-                    self:saveSettings()
-                end,
-                separator = true,
-            },
-            {
-                text_func = function()
-                    return T(_("Wi-Fi connection time limit: %1 s"), self.settings.connect_timeout)
-                end,
-                enabled_func = function() return self.settings.enabled end,
-                keep_menu_open = true,
-                callback = function(touchmenu_instance)
-                    local SpinWidget = require("ui/widget/spinwidget")
-                    UIManager:show(SpinWidget:new{
-                        value = self.settings.connect_timeout,
-                        value_min = 10,
-                        value_max = 40,
-                        value_step = 5,
-                        default_value = DEFAULTS.connect_timeout,
-                        title_text = _("Wi-Fi connection time limit"),
-                        info_text = _("How long to wait for Wi-Fi before giving up. On sleep, the device is held awake for this plus 15 seconds at most."),
-                        callback = function(spin)
-                            self.settings.connect_timeout = spin.value
-                            self:saveSettings()
-                            if touchmenu_instance then touchmenu_instance:updateItems() end
-                        end,
-                    })
-                end,
-            },
-            {
-                text = _("Connect silently (background script)"),
-                help_text = _("Uses the same background reconnect as 'Auto restore Wi-Fi': no messages on screen. Turn off to use KOReader's normal connection, which shows its usual messages."),
-                enabled_func = function() return self.settings.enabled end,
-                checked_func = function() return self.settings.method == "silent" end,
-                callback = function()
-                    self.settings.method = self.settings.method == "silent" and "standard" or "silent"
-                    self:saveSettings()
-                end,
-            },
-            self:toggleEntry("notify", _("Pop-up after a push"),
-                _("Shown when progress actually went to the server: on close, on sleep, or from the queue. Nothing for pulls, 'in sync' or when another device is ahead.")),
-            {
-                text = _("Also on the sleep screen"),
-                help_text = _("After the sleep push, a small box with the time is drawn over the sleep screen and removed on wake-up."),
-                enabled_func = function() return self.settings.enabled and self.settings.notify end,
-                checked_func = function() return self.settings.notify_on_sleep_screen end,
-                callback = function()
-                    self.settings.notify_on_sleep_screen = not self.settings.notify_on_sleep_screen
-                    self:saveSettings()
-                end,
-            },
-            {
-                text = _("Sleep screen box position"),
-                enabled_func = function() return self.settings.enabled and self.settings.notify and self.settings.notify_on_sleep_screen end,
-                sub_item_table = {
-                    self:positionEntry("bottom", _("Bottom, centred")),
-                    self:positionEntry("bottom_left", _("Bottom left corner")),
-                    self:positionEntry("bottom_right", _("Bottom right corner")),
-                },
+-- KOSync's own toggle, as it is labelled in its menu (same msgid, so the
+-- translated texts match too).
+local KOSYNC_AUTO_TEXT = _("Automatically keep documents in sync")
+
+function KOSyncWiFi:kosyncAutoSyncOn()
+    local kosync = self.ui and self.ui.kosync
+    return kosync and kosync.settings and kosync.settings.auto_sync == true
+end
+
+function KOSyncWiFi:getSubItems()
+    return {
+        {
+            text_func = statusText,
+            enabled = false,
+            separator = true,
+        },
+        {
+            text = _("Enable"),
+            -- Greyed out while KOSync's own automatic sync is on; tapping a
+            -- greyed item shows its help text, which says why.
+            enabled_func = function() return not self:kosyncAutoSyncOn() end,
+            help_text_func = function()
+                if self:kosyncAutoSyncOn() then
+                    return T(_("Turn off '%1' above first: the two cannot run together."), KOSYNC_AUTO_TEXT)
+                end
+                return _("Run Progress sync automatically and turn Wi-Fi on only for the sync.")
+            end,
+            checked_func = function() return self.settings.enabled end,
+            callback = function()
+                self.settings.enabled = not self.settings.enabled
+                self:saveSettings()
+            end,
+        },
+        {
+            text = _("Sync now"),
+            enabled_func = function() return self.settings.enabled end,
+            callback = function() self:onKOSyncWiFiSyncNow() end,
+            separator = true,
+        },
+        self:toggleEntry("on_open", _("Pull when opening a book")),
+        self:toggleEntry("on_resume", _("Pull on wake-up")),
+        self:toggleEntry("on_suspend", _("Push on sleep"),
+            _("Keeps the device awake (sleep screen already showing) until the push is done or the time limit is reached.")),
+        self:toggleEntry("on_close", _("Push when closing a book")),
+        {
+            text = _("Turn Wi-Fi off afterwards"),
+            help_text = _("Only when the plugin turned it on. Wi-Fi that was already on is left alone."),
+            enabled_func = function() return self.settings.enabled end,
+            checked_func = function() return self.settings.wifi_off_after end,
+            callback = function()
+                self.settings.wifi_off_after = not self.settings.wifi_off_after
+                self:saveSettings()
+            end,
+            separator = true,
+        },
+        {
+            text_func = function()
+                return T(_("Wi-Fi connection time limit: %1 s"), self.settings.connect_timeout)
+            end,
+            enabled_func = function() return self.settings.enabled end,
+            keep_menu_open = true,
+            callback = function(touchmenu_instance)
+                local SpinWidget = require("ui/widget/spinwidget")
+                UIManager:show(SpinWidget:new{
+                    value = self.settings.connect_timeout,
+                    value_min = 10,
+                    value_max = 40,
+                    value_step = 5,
+                    default_value = DEFAULTS.connect_timeout,
+                    title_text = _("Wi-Fi connection time limit"),
+                    info_text = _("How long to wait for Wi-Fi before giving up. On sleep, the device is held awake for this plus 15 seconds at most."),
+                    callback = function(spin)
+                        self.settings.connect_timeout = spin.value
+                        self:saveSettings()
+                        if touchmenu_instance then touchmenu_instance:updateItems() end
+                    end,
+                })
+            end,
+        },
+        {
+            text = _("Connect silently (background script)"),
+            help_text = _("Uses the same background reconnect as 'Auto restore Wi-Fi': no messages on screen. Turn off to use KOReader's normal connection, which shows its usual messages."),
+            enabled_func = function() return self.settings.enabled end,
+            checked_func = function() return self.settings.method == "silent" end,
+            callback = function()
+                self.settings.method = self.settings.method == "silent" and "standard" or "silent"
+                self:saveSettings()
+            end,
+        },
+        self:toggleEntry("notify", _("Pop-up after a push"),
+            _("Shown when progress actually went to the server: on close, on sleep, or from the queue. Nothing for pulls, 'in sync' or when another device is ahead.")),
+        {
+            text = _("Also on the sleep screen"),
+            help_text = _("After the sleep push, a small box with the time is drawn over the sleep screen and removed on wake-up."),
+            enabled_func = function() return self.settings.enabled and self.settings.notify end,
+            checked_func = function() return self.settings.notify_on_sleep_screen end,
+            callback = function()
+                self.settings.notify_on_sleep_screen = not self.settings.notify_on_sleep_screen
+                self:saveSettings()
+            end,
+        },
+        {
+            text = _("Sleep screen box position"),
+            enabled_func = function() return self.settings.enabled and self.settings.notify and self.settings.notify_on_sleep_screen end,
+            sub_item_table = {
+                self:positionEntry("bottom", _("Bottom, centred")),
+                self:positionEntry("bottom_left", _("Bottom left corner")),
+                self:positionEntry("bottom_right", _("Bottom right corner")),
             },
         },
     }
 end
 
+-- In the reader, the entry goes inside KOSync's own "Progress sync" menu,
+-- right after its automatic-sync items, and KOSync's toggle is greyed out
+-- while this plugin is enabled (its help text explains). In the file manager
+-- KOSync has no menu, so the entry stays under Tools.
+function KOSyncWiFi:addToMainMenu(menu_items)
+    local entry = {
+        text = _("Wi-Fi on demand sync"),
+        sub_item_table = self:getSubItems(),
+    }
+
+    local ps = menu_items.progress_sync
+    local items = ps and ps.sub_item_table
+    if items then
+        local auto_idx
+        for i, item in ipairs(items) do
+            if item.text == KOSYNC_AUTO_TEXT then
+                auto_idx = i
+                break
+            end
+        end
+        if auto_idx then
+            local auto_item = items[auto_idx]
+            local original_help = auto_item.help_text
+            auto_item.enabled_func = function() return not self.settings.enabled end
+            auto_item.help_text = nil
+            auto_item.help_text_func = function()
+                if self.settings.enabled then
+                    return _("Turn off 'Wi-Fi on demand sync' below first: the two cannot run together.")
+                end
+                return original_help
+            end
+            -- Slot in after the pages-before-update item that belongs to it,
+            -- taking over its separator.
+            local at = auto_idx + 1
+            local pages_item = items[at]
+            if pages_item and pages_item.text_func and pages_item.separator then
+                pages_item.separator = nil
+                at = at + 1
+            end
+            entry.separator = true
+            table.insert(items, at, entry)
+        else
+            table.insert(items, entry)
+        end
+        return
+    end
+
+    entry.text = _("Progress sync: Wi-Fi on demand")
+    entry.sorting_hint = "tools"
+    menu_items.kosyncwifi = entry
+end
+
 return KOSyncWiFi
+
