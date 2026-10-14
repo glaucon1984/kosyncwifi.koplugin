@@ -37,7 +37,9 @@ the plugin switches it off if it finds it on.
    *Progress sync: Wi-Fi on demand*).
 
 The two automatic modes exclude each other, so each one's toggle is greyed
-out while the other is on; tapping the greyed item shows why.
+out while the other is on; tapping the greyed item shows why. Opening
+*Wi-Fi on demand sync* while Progress sync's automatic sync is on shows a
+pop-up explaining why everything in it is off, and its first line says so too.
 
 A *Sync now* entry and a dispatcher action (gestures / profiles) are provided.
 Sync now pushes and pulls and shows one summary line; when KOSync asks whether

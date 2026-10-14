@@ -209,8 +209,8 @@ scenario("open a book: pull only once DHCP is done, then Wi-Fi off", function()
     check(not wifi.modules, "wifi is off at the end")
     check(not NetworkMgr.pending_connection, "no pending connection left")
     check(gsettings.wifi_was_on == true, "wifi_was_on restored to prior value")
-    local items = {} p:addToMainMenu(items) check(items.kosyncwifi and #items.kosyncwifi.sub_item_table > 5, "menu builds (Tools fallback)")
-    check(items.kosyncwifi.sub_item_table[1].text_func():find("open"), "status: " .. items.kosyncwifi.sub_item_table[1].text_func())
+    local items = {} p:addToMainMenu(items) local sub = items.kosyncwifi and items.kosyncwifi.sub_item_table_func() check(sub and #sub > 5, "menu builds (Tools fallback)")
+    check(sub[1].text_func():find("open"), "status: " .. sub[1].text_func())
 end)
 
 scenario("sleep with a book: hold suspend, push after DHCP, release", function()
@@ -643,11 +643,23 @@ scenario("menu: entry goes inside Progress sync, both toggles grey each other ou
     check(auto.enabled_func() == true and auto.help_text_func() == "KOSync help", "KOSync toggle back with its own help")
     -- KOSync auto on -> our Enable greyed with a reason
     kosync.settings.auto_sync = true
-    local enable = list[4].sub_item_table[2]
+    local before = #log
+    local sub = list[4].sub_item_table_func()           -- as menu search / position restore would call it
+    check(not lastLogHas("[show]"), "no pop-up when built outside a tap")
+    local TouchMenu = {}
+    function TouchMenu:onMenuSelect(item) return item.sub_item_table_func() end
+    sub = TouchMenu:onMenuSelect(list[4])                -- as a tap does
+    check(lastLogHas("[show] Wi-Fi on demand sync is off while"), "pop-up explains the greyed menu on tap")
+    check(sub[1].text_func():find("Off: turn off"), "first line says why too")
+    local enable = sub[2]
     check(enable.text == "Enable" and enable.enabled_func() == false, "our Enable disabled while KOSync auto is on")
     check(enable.help_text_func():find("Automatically keep documents in sync"), "its help text says why")
     kosync.settings.auto_sync = false
-    check(enable.enabled_func() == true, "our Enable back")
+    before = #log
+    TouchMenu:onMenuSelect(list[4])
+    local shown = false
+    for i = before + 1, #log do if log[i]:find("[show]", 1, true) then shown = true end end
+    check(not shown and enable.enabled_func() == true, "no pop-up and Enable back once KOSync auto is off")
     p.settings.enabled = true
 end)
 

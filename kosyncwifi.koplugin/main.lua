@@ -1023,10 +1023,17 @@ function KOSyncWiFi:kosyncAutoSyncOn()
     return kosync and kosync.settings and kosync.settings.auto_sync == true
 end
 
+local BLOCKED_TEXT = _("Wi-Fi on demand sync is off while Progress sync's 'Automatically keep documents in sync' is on. Turn that off to use it.")
+
 function KOSyncWiFi:getSubItems()
     return {
         {
-            text_func = statusText,
+            text_func = function()
+                if self:kosyncAutoSyncOn() then
+                    return _("Off: turn off 'Automatically keep documents in sync'")
+                end
+                return statusText()
+            end,
             enabled = false,
             separator = true,
         },
@@ -1134,7 +1141,16 @@ end
 function KOSyncWiFi:addToMainMenu(menu_items)
     local entry = {
         text = _("Wi-Fi on demand sync"),
-        sub_item_table = self:getSubItems(),
+        -- Built when opened, so we can explain a fully greyed-out menu with a
+        -- pop-up. The same function is also called by menu search and by the
+        -- menu's position restore, where a pop-up would be wrong: only show it
+        -- when we were reached from a tap (TouchMenu:onMenuSelect).
+        sub_item_table_func = function()
+            if self:kosyncAutoSyncOn() and debug.traceback():find("onMenuSelect", 1, true) then
+                UIManager:show(InfoMessage:new{ text = BLOCKED_TEXT })
+            end
+            return self:getSubItems()
+        end,
     }
 
     local ps = menu_items.progress_sync
