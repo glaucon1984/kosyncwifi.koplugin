@@ -178,6 +178,7 @@ local function drainQueue(creds)
     if not creds then return 0, 0 end
     local client = newClient(creds)
     local dropped = 0
+    local titles = {}
     local sent = KOSyncQueue:drain(function(item)
         -- Items queued by KOSync itself carry no reading time; they come from
         -- a push we had already vetted, so their queue time stands in for it.
@@ -208,9 +209,19 @@ local function drainQueue(creds)
             item.device,
             item.device_id,
             function() end)
+        if ok then
+            table.insert(titles, item.metadata and item.metadata.title or item.document)
+        end
         return ok
     end)
-    return sent - dropped, dropped
+    return sent - dropped, dropped, titles
+end
+
+-- "Vestigios" / "Vestigios, Silo (2 books)" for a pop-up about queued sends.
+local function titlesText(titles)
+    if #titles == 0 then return "" end
+    if #titles == 1 then return titles[1] end
+    return T(_("%1 (%2 books)"), table.concat(titles, ", "), #titles)
 end
 
 -- ---------------------------------------------------------------------------
@@ -651,9 +662,9 @@ function KOSyncWiFi:doSync(opts)
     local all_ok = true
     local pushed = false
     local prompt_shown = false
-    local sent, dropped = drainQueue()
+    local sent, dropped, titles = drainQueue()
     if sent and sent > 0 then
-        table.insert(parts, T(_("%1 queued sent"), sent))
+        table.insert(parts, T(_("queued sent: %1"), titlesText(titles)))
         pushed = true
     end
     if dropped and dropped > 0 then
@@ -799,16 +810,16 @@ function KOSyncWiFi:onCloseDocument()
             Link.setLast("close", false, _("no Wi-Fi, queued"))
             return
         end
-        local sent, dropped = drainQueue(creds)
-        sent, dropped = sent or 0, dropped or 0
-        local summary = T(_("%1 queued sent"), sent)
+        local sent, dropped, titles = drainQueue(creds)
+        sent, dropped, titles = sent or 0, dropped or 0, titles or {}
+        local summary = sent > 0 and T(_("queued sent: %1"), titlesText(titles)) or T(_("%1 queued sent"), sent)
         if dropped > 0 then
             summary = summary .. ", " .. T(_("%1 queued dropped"), dropped)
         end
         Link.setLast("close", queueCount() == 0, summary)
         logger.info("KOSyncWiFi: close sync done:", summary)
         if sent > 0 then
-            showPushed(settings, _("Progress pushed."))
+            showPushed(settings, T(_("Progress pushed: %1 (queued)."), titlesText(titles)))
         end
     end)
 end

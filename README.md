@@ -60,7 +60,9 @@ to move to the newer location, the summary is skipped so nothing overlaps.
   if the silent script never connects on your device.
 - **Pop-up after a push** (default on). Shown only when progress actually
   went to the server: after closing a book, after the sleep push, or when the
-  offline queue was sent. Nothing for pulls (KOReader asks before moving you
+  offline queue was sent. A queued position is often sent later, for example
+  while the next book is being opened, so that pop-up names the book it
+  belongs to: "Progress pushed: Vestigios (queued)." Nothing for pulls (KOReader asks before moving you
   anyway), "in sync" or when another device is ahead.
 - **Also on the sleep screen** (default on). After the sleep push a small
   square box in a serif face, "Progress pushed at HH:MM", is drawn near the

@@ -135,7 +135,7 @@ local function resetKOSync()
     end
     function kosync:getProgress() say("  [kosync] getProgress route=" .. tostring(wifi.route)) end
     function kosync:getDocumentDigest() return "digest1" end
-    function kosync:getMetadata() return {} end
+    function kosync:getMetadata() return { title = "Vestigios" } end
     function kosync:getLastProgress() return "/body/x" end
     function kosync:getLastPercent() return 0.5 end
     function kosync:onKOSyncToggleAutoSync(v) say("  [kosync] toggle auto sync", v) self.settings.auto_sync = false end
@@ -292,7 +292,7 @@ scenario("queued position is dropped when another device moved on since", functi
     check(#queue == 0, "queue empty")
     check(lastLogHas("dropping a queued position for d1"), "d1 dropped")
     check(lastLogHas("update_progress (queue item) d2"), "d2 sent")
-    check(Link.last and Link.last.detail:find("1 queued sent, 1 queued dropped"), "summary: " .. tostring(Link.last and Link.last.detail))
+    check(Link.last and Link.last.detail:find("queued sent: d2, 1 queued dropped"), "summary: " .. tostring(Link.last and Link.last.detail))
 end)
 
 scenario("queue kept when the server cannot be asked", function()
@@ -522,7 +522,7 @@ scenario("pop-ups: offline close, queue sent later, pop-up then", function()
     p:onPageUpdate(2)
     p:onCloseDocument()
     advance(40)
-    check(lastLogHas("[show] Progress pushed."), "pop-up after the background send")
+    check(lastLogHas("[show] Progress pushed: Vestigios (queued)."), "pop-up after the background send names the book")
 end)
 
 scenario("pop-ups: disabled setting shows nothing", function()
