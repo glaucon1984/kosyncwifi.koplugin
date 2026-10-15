@@ -511,9 +511,9 @@ scenario("pop-ups: online close push shows a pop-up above the file manager", fun
     p:onPageUpdate(2)
     wifi.modules = true wifi.address = true wifi.route = true
     p:onCloseDocument()
-    check(not lastLogHas("[show] Progress pushed."), "not shown synchronously during close")
+    check(not lastLogHas("[show] Progress pushed: Vestigios."), "not shown synchronously during close")
     advance(now + 2)
-    check(lastLogHas("[show] Progress pushed."), "shown shortly after")
+    check(lastLogHas("[show] Progress pushed: Vestigios."), "shown shortly after, naming the book")
 end)
 
 scenario("pop-ups: offline close, queue sent later, pop-up then", function()

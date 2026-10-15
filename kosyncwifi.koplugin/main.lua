@@ -562,6 +562,15 @@ local function pushedText(summary)
     return T(_("Progress pushed (%1)."), summary)
 end
 
+-- Title of the open book, for pop-ups that may be read later, over another book.
+function KOSyncWiFi:bookTitle(kosync)
+    local meta = kosync and kosync.getMetadata and kosync:getMetadata()
+    if meta and meta.title and meta.title ~= "" then return meta.title end
+    local props = self.ui and self.ui.doc_props
+    if props and props.display_title then return props.display_title end
+    return _("this book")
+end
+
 -- ---- reading-time tracking --------------------------------------------------
 -- KOSync only records page turns while its own automatic sync is on, so we
 -- keep our own "last page turned in this book" time, persisted per book, and
@@ -767,8 +776,11 @@ function KOSyncWiFi:onCloseDocument()
         Link.setLast("close", ok, part or _("nothing to do"))
         if ok and part == _("pushed") then
             -- The file manager is about to be shown; put the pop-up above it.
+            -- Name the book: if the next one is opened straight away, this
+            -- fires above it, after the document load.
             local settings = self.settings
-            UIManager:scheduleIn(0.5, function() showPushed(settings, _("Progress pushed.")) end)
+            local text = T(_("Progress pushed: %1."), self:bookTitle(kosync))
+            UIManager:scheduleIn(0.5, function() showPushed(settings, text) end)
         end
         return
     end
