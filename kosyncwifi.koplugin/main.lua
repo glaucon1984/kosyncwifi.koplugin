@@ -268,23 +268,28 @@ end
 local RADIO_SCRIPTS = { "restore-wifi-async.sh", "enable-wifi.sh", "disable-wifi.sh", "obtain-ip.sh" }
 local RADIO_PROGRAMS = { wmt_loader = true, insmod = true }
 
--- The first of those found in `processes`, as text for the log, or nil. With
--- radio_down, Kobo's Bluetooth daemon counts as well (but only if nothing
--- else does): contacted while the radio is not started, it starts it itself.
+-- Kobo's Bluetooth service (mtkbtd starts btservice).
+local BT_SERVICE_PROGRAMS = { mtkbtd = true, btservice = true }
+
+-- The first of those found in `processes`, as text for the log, or nil. A
+-- script counts when it is what runs (argv[0], or argv[1] after its shell),
+-- not when a command line merely mentions it. With radio_down, Kobo's
+-- Bluetooth service counts as well (but only if nothing else does):
+-- contacted while the radio is not started, it starts it itself.
 local function findRadioWork(processes, radio_down)
     local bt_service
     for _, p in ipairs(processes) do
         local program = programOf(p.cmdline)
-        local args = p.cmdline:gsub("%z", " ")
+        local second = (p.cmdline:match("^[^%z]*%z([^%z]*)") or ""):match("[^/]*$")
         for _, script in ipairs(RADIO_SCRIPTS) do
-            if args:find(script, 1, true) then
+            if program == script or second == script then
                 return script
             end
         end
         if RADIO_PROGRAMS[program] then
             return program
         end
-        if radio_down and program == "mtkbtd" then
+        if radio_down and BT_SERVICE_PROGRAMS[program] then
             bt_service = program
         end
     end
@@ -371,10 +376,11 @@ end
 -- Runs a shell command in its own session (working directory /, off the
 -- onboard partition) and waits for it, at most `limit` seconds. Returns true
 -- and its exit status, or false if it was still running at the limit; it is
--- then killed together with anything it started.
+-- then killed together with anything it started. The command runs in a
+-- subshell, so even an `exit` in it leaves the status to be written.
 function Radio.run(command, limit)
     os.remove(Radio.STATUS_FILE)
-    local script = command .. "; echo $? >" .. Radio.STATUS_FILE
+    local script = "(" .. command .. "); echo $? >" .. Radio.STATUS_FILE
     local starter = io.popen("cd / && setsid sh -c " .. shellQuote(script) .. " >/dev/null 2>&1 </dev/null & echo $!")
     local pid = starter and tonumber(starter:read("*l") or "")
     if starter then starter:close() end
@@ -679,7 +685,7 @@ end
 -- radio by then, it is not going to.
 function Link.radioWork(job, radio_down)
     local work = findRadioWork(Link.listProcesses(), radio_down)
-    if work == "mtkbtd" then
+    if BT_SERVICE_PROGRAMS[work] then
         job.bt_service_seen = job.bt_service_seen or os.time()
         if os.time() - job.bt_service_seen > BT_SERVICE_WAIT then
             return nil

@@ -629,7 +629,10 @@ scenario("radio work found in /proc: scripts, loader, insmod; the Bluetooth daem
     check(work({ { pid = 1, cmdline = "insmod\0/drivers/x/mt66xx/wmt_drv.ko\0" } }, false) == "insmod", "insmod")
     check(work({ { pid = 1, cmdline = "/usr/bin/mtkbtd\0" } }, false) == nil, "mtkbtd ignored while the radio is up")
     check(work({ { pid = 1, cmdline = "/usr/bin/mtkbtd\0" }, { pid = 2, cmdline = "/usr/bin/wmt_loader\0" } }, true) == "wmt_loader", "the loader wins over mtkbtd")
-    check(work({ { pid = 1, cmdline = "/usr/bin/wmt_launcher\0-p\0/lib/firmware\0" }, { pid = 2, cmdline = "./reader.lua\0" } }, true) == nil, "the running firmware daemon is not work")
+    check(work({ { pid = 1, cmdline = "/usr/bin/wmt_launcher\0-p\0/lib/firmware\0" }, { pid = 2, cmdline = "./luajit\0./reader.lua\0" } }, true) == nil, "the running firmware daemon is not work")
+    check(work({ { pid = 1, cmdline = "sh\0-c\0for p in /proc; do case $c in *enable-wifi.sh*) ;; esac; done\0" } }, false) == nil, "a command line that only mentions a script is not work")
+    check(work({ { pid = 1, cmdline = "./restore-wifi-async.sh\0" } }, false) == "restore-wifi-async.sh", "a script run directly")
+    check(work({ { pid = 1, cmdline = "/usr/bin/btservice\0" } }, true) == "btservice", "btservice counts while the radio is down")
 end)
 
 scenario("isLauncherRunning finds wmt_launcher by program name in /proc", function()
