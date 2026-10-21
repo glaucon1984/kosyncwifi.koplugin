@@ -251,16 +251,40 @@ local function findProcess(test)
     if ok then return res end
 end
 
--- Every running process as { pid, cmdline } (arguments NUL-separated).
+-- State letter and parent pid of a process, from /proc/<pid>/stat
+-- ("pid (comm) state ppid ...", comm may hold spaces and parentheses).
+local function statOf(pid)
+    local f = io.open("/proc/" .. pid .. "/stat", "r")
+    if not f then return nil end
+    local stat = f:read("*l") or ""
+    f:close()
+    local state, ppid = stat:match("^.*%) (%S) (%d+)")
+    return state, tonumber(ppid)
+end
+
+-- Every running process as { pid, ppid, cmdline } (arguments NUL-separated).
 local function listProcesses()
     local list = {}
-    findProcess(function(cmdline, pid) table.insert(list, { pid = pid, cmdline = cmdline }) end)
+    findProcess(function(cmdline, pid)
+        local _, ppid = statOf(pid)
+        table.insert(list, { pid = pid, ppid = ppid, cmdline = cmdline })
+    end)
     return list
 end
 
 -- Program name of a command line (argv[0] without its directory).
 local function programOf(cmdline)
     return (cmdline:match("^[^%z]*") or ""):match("[^/]*$")
+end
+
+-- argv[1] without its directory: the script, when argv[0] is its shell.
+local function secondOf(cmdline)
+    return (cmdline:match("^[^%z]*%z([^%z]*)") or ""):match("[^/]*$")
+end
+
+-- Whether a command line runs `script` (not merely mentions it).
+local function runsScript(cmdline, script)
+    return programOf(cmdline) == script or secondOf(cmdline) == script
 end
 
 -- What changes the radio's state while it runs: KOReader's Wi-Fi scripts,
@@ -280,9 +304,8 @@ local function findRadioWork(processes, radio_down)
     local bt_service
     for _, p in ipairs(processes) do
         local program = programOf(p.cmdline)
-        local second = (p.cmdline:match("^[^%z]*%z([^%z]*)") or ""):match("[^/]*$")
         for _, script in ipairs(RADIO_SCRIPTS) do
-            if program == script or second == script then
+            if runsScript(p.cmdline, script) then
                 return script
             end
         end
@@ -298,7 +321,7 @@ end
 
 -- pid of a running restore-wifi-async.sh, or nil.
 local function findScript()
-    return findProcess(function(cmdline) return cmdline:find(RESTORE_SCRIPT, 1, true) end)
+    return findProcess(function(cmdline) return runsScript(cmdline, RESTORE_SCRIPT) end)
 end
 
 -- MediaTek's firmware daemon, by program name (Nickel, the Bluetooth daemon
@@ -307,11 +330,120 @@ local function isLauncherRunning()
     return findProcess(function(cmdline) return programOf(cmdline) == "wmt_launcher" end) ~= nil
 end
 
+-- Stopping KOReader's restore script (a failed attempt, USB mass storage,
+-- power off). TERM on the script alone is not enough: it runs its steps as
+-- child processes (enable-wifi.sh, wpa_cli, usleep, obtain-ip.sh and its DHCP
+-- client) from the onboard partition, with KOReader's crash.log as their
+-- output, and they carry on once the script is gone, keeping the partition
+-- busy so USB mass storage fails. So the script and everything it started are
+-- stopped; only a running enable-wifi.sh is let finish (a few seconds, with
+-- its own steps) rather than cut off in the middle of the chip handshake.
+local Proc = {
+    TERM_GRACE = 1,       -- seconds before a TERMed process gets KILL
+    ENABLE_WIFI_WAIT = 8, -- seconds a running enable-wifi.sh may take to finish
+    POLL = 0.1,
+    list = listProcesses, -- replaceable for tests
+    findScript = findScript,
+}
+
+function Proc.isAlive(pid)
+    local state = statOf(pid)
+    return state ~= nil and state ~= "Z"
+end
+
+function Proc.signal(pid, name)
+    if pid > 1 then
+        os.execute(string.format("kill -%s %d 2>/dev/null", name, pid))
+    end
+end
+
+-- ffi/util's sleep() is C's sleep(): whole seconds only.
+function Proc.sleep(seconds)
+    require("ffi/util").usleep(math.floor(seconds * 1000000))
+end
+
+-- Label for the log: the script a shell runs, else the program.
+local function labelOf(cmdline)
+    local second = secondOf(cmdline)
+    return second:match("%.sh$") and second or programOf(cmdline)
+end
+
+-- What `root` started, directly or not, as { pid, ppid, cmdline }, except
+-- what a running enable-wifi.sh started itself (it finishes its own steps).
+local function scriptTree(root, processes)
+    local children = {}
+    for _, p in ipairs(processes) do
+        if p.ppid then
+            children[p.ppid] = children[p.ppid] or {}
+            table.insert(children[p.ppid], p)
+        end
+    end
+    local tree, queue = {}, { root }
+    while #queue > 0 do
+        for _, child in ipairs(children[table.remove(queue, 1)] or {}) do
+            table.insert(tree, child)
+            if not runsScript(child.cmdline, "enable-wifi.sh") then
+                table.insert(queue, child.pid)
+            end
+        end
+    end
+    return tree
+end
+
+-- Stops `root` and its tree (see above) and waits until they are gone.
+function Proc.stopScriptTree(root)
+    local pending, labels = { [root] = "term" }, {}
+    for _, p in ipairs(scriptTree(root, Proc.list())) do
+        pending[p.pid] = runsScript(p.cmdline, "enable-wifi.sh") and "finish" or "term"
+        table.insert(labels, labelOf(p.cmdline))
+    end
+    logger.warn("KOSyncWiFi: stopping " .. RESTORE_SCRIPT .. " (pid " .. root .. ")"
+        .. (#labels > 0 and " and what it started: " .. table.concat(labels, ", ") or ""))
+    Proc.signal(root, "TERM") -- first, so it starts nothing new
+    for pid, how in pairs(pending) do
+        if how == "term" and pid ~= root then
+            Proc.signal(pid, "TERM")
+        end
+    end
+    local waited = 0
+    while true do
+        local left = 0
+        for pid, how in pairs(pending) do
+            if not Proc.isAlive(pid) then
+                pending[pid] = nil
+            else
+                left = left + 1
+                if how == "term" and waited >= Proc.TERM_GRACE then
+                    Proc.signal(pid, "KILL")
+                    pending[pid] = "killed"
+                end
+            end
+        end
+        if left == 0 then
+            return
+        end
+        if waited >= Proc.ENABLE_WIFI_WAIT then
+            for pid in pairs(pending) do
+                Proc.signal(pid, "KILL")
+            end
+            logger.warn("KOSyncWiFi: killed what was still running after", Proc.ENABLE_WIFI_WAIT, "s")
+            return
+        end
+        Proc.sleep(Proc.POLL)
+        waited = waited + Proc.POLL
+    end
+end
+
+-- Stops the restore script `pid`, or every one running (ours or not).
 local function killScript(pid)
-    pid = pid or findScript()
     if pid then
-        logger.warn("KOSyncWiFi: stopping " .. RESTORE_SCRIPT .. " (pid " .. pid .. ")")
-        os.execute("kill -TERM " .. pid .. " 2>/dev/null")
+        Proc.stopScriptTree(pid)
+        return
+    end
+    for _ = 1, 3 do
+        pid = Proc.findScript()
+        if not pid then return end
+        Proc.stopScriptTree(pid)
     end
 end
 
@@ -847,6 +979,8 @@ local KOSyncWiFi = WidgetContainer:extend{
 }
 KOSyncWiFi._Link = Link -- for tests
 KOSyncWiFi._Radio = Radio
+KOSyncWiFi._Proc = Proc
+KOSyncWiFi._killScript = killScript
 
 function KOSyncWiFi:init()
     local s = G_reader_settings:readSetting("kosyncwifi") or {}

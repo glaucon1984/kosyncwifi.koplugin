@@ -1014,6 +1014,110 @@ scenario("launch(): same as Sync now, for other plugins' action pickers", functi
 end)
 
 
+-- Stopping the restore script: everything it started goes too (it would keep
+-- the onboard partition busy and block USB mass storage), except that a
+-- running enable-wifi.sh finishes its steps. A fake process table: each entry
+-- { pid, ppid, cmdline, ends_at = finishes on its own, ignores_term }.
+local Proc = Plugin._Proc
+local real_killScript = Plugin._killScript
+local function fakeProcesses(list)
+    local by_pid, signals = {}, {}
+    for _, p in ipairs(list) do p.alive = true by_pid[p.pid] = p end
+    local saved = { list = Proc.list, isAlive = Proc.isAlive, signal = Proc.signal, sleep = Proc.sleep, findScript = Proc.findScript }
+    Proc.list = function() local t = {} for _, p in ipairs(list) do if p.alive then table.insert(t, p) end end return t end
+    Proc.isAlive = function(pid)
+        local p = by_pid[pid]
+        if p and p.alive and p.ends_at and now >= p.ends_at then p.alive = false end
+        return p ~= nil and p.alive
+    end
+    Proc.signal = function(pid, name)
+        table.insert(signals, name .. " " .. pid)
+        local p = by_pid[pid]
+        if p and (name == "KILL" or not p.ignores_term) then p.alive = false end
+    end
+    Proc.sleep = function(s) now = now + s end
+    Proc.findScript = function()
+        for _, p in ipairs(list) do if p.alive and p.cmdline:find("restore-wifi-async.sh", 1, true) then return p.pid end end
+    end
+    local function restore() for k, v in pairs(saved) do Proc[k] = v end end
+    return by_pid, signals, restore
+end
+local function sent(signals, s) for _, x in ipairs(signals) do if x == s then return true end end return false end
+
+scenario("stopping the restore script: its steps are stopped, a running enable-wifi.sh finishes", function()
+    local procs, signals, restore = fakeProcesses({
+        { pid = 100, ppid = 1, cmdline = "/bin/sh\0./restore-wifi-async.sh\0" },
+        { pid = 101, ppid = 100, cmdline = "/bin/sh\0./enable-wifi.sh\0", ends_at = 3 },
+        { pid = 102, ppid = 101, cmdline = "insmod\0/drivers/x/mt66xx/wlan_drv_gen4m.ko\0", ends_at = 3 },
+        { pid = 103, ppid = 100, cmdline = "usleep\0" .. "250000\0" },
+        { pid = 200, ppid = 1, cmdline = "./luajit\0./reader.lua\0" },
+        { pid = 201, ppid = 1, cmdline = "wpa_supplicant\0-B\0" },
+    })
+    real_killScript(100)
+    restore()
+    check(sent(signals, "TERM 100") and sent(signals, "TERM 103"), "script and its usleep TERMed")
+    check(not sent(signals, "TERM 101") and not sent(signals, "KILL 101"), "enable-wifi.sh not signalled")
+    check(not sent(signals, "TERM 102"), "enable-wifi.sh's own steps left to it")
+    check(not sent(signals, "TERM 200") and not sent(signals, "TERM 201"), "nothing outside the tree touched")
+    check(not procs[101].alive and now >= 3 and now < 3.5, "waited for enable-wifi.sh to finish (" .. now .. " s)")
+    check(lastLogHas("and what it started: enable-wifi.sh, usleep"), "logged what it stopped")
+end)
+
+scenario("stopping the restore script during DHCP: obtain-ip.sh and the DHCP client stopped, KILL after 1 s if needed", function()
+    local procs, signals, restore = fakeProcesses({
+        { pid = 300, ppid = 1, cmdline = "/bin/sh\0./restore-wifi-async.sh\0" },
+        { pid = 301, ppid = 300, cmdline = "/bin/sh\0./obtain-ip.sh\0" },
+        { pid = 302, ppid = 301, cmdline = "dhcpcd\0-d\0-t\0" .. "30\0-w\0wlan0\0", ignores_term = true },
+    })
+    real_killScript(300)
+    restore()
+    check(sent(signals, "TERM 301") and sent(signals, "TERM 302"), "obtain-ip.sh and dhcpcd TERMed")
+    check(sent(signals, "KILL 302") and not procs[302].alive, "dhcpcd ignored TERM and got KILL")
+    check(now >= 1 and now < 1.5, "after the 1 s grace (" .. now .. " s)")
+end)
+
+scenario("stopping the restore script: an enable-wifi.sh that never ends is killed after 8 s", function()
+    local procs, signals, restore = fakeProcesses({
+        { pid = 400, ppid = 1, cmdline = "/bin/sh\0./restore-wifi-async.sh\0" },
+        { pid = 401, ppid = 400, cmdline = "/bin/sh\0./enable-wifi.sh\0" },
+    })
+    real_killScript(400)
+    restore()
+    check(sent(signals, "KILL 401") and not procs[401].alive, "killed")
+    check(now >= 8 and now < 8.5, "after 8 s (" .. now .. " s)")
+    check(lastLogHas("killed what was still running after 8 s"), "logged")
+end)
+
+scenario("killScript without a pid stops every restore script running, then stops looking", function()
+    local procs, signals, restore = fakeProcesses({
+        { pid = 500, ppid = 1, cmdline = "/bin/sh\0./restore-wifi-async.sh\0" },
+        { pid = 501, ppid = 1, cmdline = "/bin/sh\0./restore-wifi-async.sh\0" },
+    })
+    real_killScript()
+    restore()
+    check(sent(signals, "TERM 500") and sent(signals, "TERM 501"), "both stopped")
+    check(not procs[500].alive and not procs[501].alive, "both gone")
+end)
+
+scenario("USB mass storage during our Wi-Fi start: the real stop runs before KOReader quits", function()
+    local procs, signals, restore = fakeProcesses({
+        { pid = 600, ppid = 1, cmdline = "/bin/sh\0./restore-wifi-async.sh\0" },
+        { pid = 601, ppid = 600, cmdline = "/bin/sh\0./obtain-ip.sh\0" },
+    })
+    local stub = Link.killScript
+    Link.killScript = real_killScript
+    local p = newReader()
+    p:onPageUpdate(2)
+    p:onCloseDocument()
+    advance(2)
+    p:onClose()
+    Link.killScript = stub
+    restore()
+    check(sent(signals, "TERM 600") and sent(signals, "TERM 601"), "restore script and obtain-ip.sh stopped")
+    check(lastLogHas("[net] disableWifi"), "then Wi-Fi turned off")
+    check(Link.job == nil and #queue == 1, "job aborted, position still queued")
+end)
+
 print(table.concat(log, "\n"))
 print(failures == 0 and "\nALL SCENARIOS PASSED" or ("\n" .. failures .. " CHECK(S) FAILED"))
 os.exit(failures == 0 and 0 or 1)
