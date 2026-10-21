@@ -27,7 +27,7 @@ local function advance(to)
         local t = tasks[1]
         if not t or t.t > to then break end
         table.remove(tasks, 1)
-        now = t.t
+        now = math.max(now, t.t) -- a blocking step may already have moved the clock past it
         t.fn(unpack(t.args))
     end
     now = to
@@ -177,24 +177,63 @@ Link.findScript = function() tickWifi() return wifi.script and wifi.script.pid e
 Link.killScript = function(pid) say("  [kill] script pid", tostring(pid)) wifi.script = nil end
 local menu = { registerToMainMenu = function() end }
 
--- MTK radio stack: by default the harness device is not an MTK Kobo, so the
--- stack check never runs. mtk(files, launcher) makes it one, with `files`
--- (path -> mode) as the only existing paths and the firmware daemon running or not.
+-- MTK radio: by default the harness device is not an MTK Kobo, so none of the
+-- radio code runs. mtk{...} makes it one, with a fake radio: loaded modules,
+-- the firmware daemon, kobo.koplugin's ready marker, other processes, and
+-- every start-up step recorded in radio.steps. Radio.run and Radio.sleep block
+-- in the real plugin, so the fakes move the clock without running any
+-- scheduled task: whatever is scheduled meanwhile runs only afterwards.
 local lfs_stub = stubs["libs/libkoreader-lfs"]
-local real_isLauncherRunning = Link.isLauncherRunning
+local Radio = Plugin._Radio
+local real = { isLauncherRunning = Link.isLauncherRunning, listProcesses = Link.listProcesses }
+local radio
 local function yes() return true end
+local ALL_MODULES = { "wmt_drv", "wmt_chrdev_wifi", "wmt_cdev_bt", "wlan_drv_gen4m" }
 local function resetRadio()
+    -- hang[key]: that step runs into its time limit; fail[key]: it exits with 1
+    -- (keys: a module name, "loader", "launcher", a handshake value)
+    radio = { modules = {}, launcher = false, marker = false, procs = {}, steps = {}, hang = {}, fail = {} }
     Device.isKobo = nil Device.isMTK = nil
-    lfs_stub.attributes = function() return nil end
-    Link.isLauncherRunning = real_isLauncherRunning
+    lfs_stub.attributes = function(path)
+        if path == "/dev/stpbt" then return radio.modules.wmt_cdev_bt and "char device" or nil end
+        if path == "/tmp/kobo.koplugin-wmt-stack-ready" then return radio.marker and "file" or nil end
+        return nil
+    end
+    Link.isLauncherRunning = function() return radio.launcher end
+    Link.listProcesses = function() return radio.procs end
+    Radio.loadedModules = function() local t = {} for k, v in pairs(radio.modules) do t[k] = v end return t end
+    Radio.sleep = function(s) now = now + s end
+    Radio.startLauncher = function()
+        table.insert(radio.steps, "launcher")
+        if not radio.fail.launcher then radio.launcher = true end
+    end
+    Radio.run = function(command, limit)
+        table.insert(radio.steps, command)
+        local module = command:match("insmod %S*/([%w_]+)%.ko")
+        local key = module or (command:find("wmt_loader", 1, true) and "loader") or command:match("^echo '?([^'>]+)'? >")
+        if radio.hang[key] then now = now + limit return false end
+        now = now + 0.1
+        if radio.fail[key] then return true, 1 end
+        if module then radio.modules[module] = true end
+        if key == "loader" then
+            for i = 2, #ALL_MODULES do if not radio.fail[ALL_MODULES[i]] then radio.modules[ALL_MODULES[i]] = true end end
+            return true, 255
+        end
+        return true, 0
+    end
     package.loaded["src/kobo_bluetooth"] = nil
     package.loaded["src/lib/bluetooth/wmt_power"] = nil
 end
-local function mtk(files, launcher)
+local function mtk(state)
     Device.isKobo = yes Device.isMTK = yes
-    lfs_stub.attributes = function(path) return files and files[path] or nil end
-    Link.isLauncherRunning = function() return launcher == true end
+    for k, v in pairs(state or {}) do radio[k] = v end
 end
+-- What Nickel, kobo.koplugin or a finished start-up leaves behind.
+local function radioUp()
+    local modules = {} for _, m in ipairs(ALL_MODULES) do modules[m] = true end
+    return { modules = modules, launcher = true }
+end
+local function stepIndex(s) for i, st in ipairs(radio.steps) do if st:find(s, 1, true) then return i end end end
 
 local doc_settings_store = {}
 local function newReader()
@@ -342,102 +381,235 @@ scenario("wake: Bluetooth plugin has Wi-Fi borrowed, we wait for it", function()
     check(not wifi.modules, "wifi off at the end")
 end)
 
--- A boot where Nickel never used the radio (MTK): enable-wifi.sh would panic the kernel.
-scenario("cold MTK boot, nobody brings the radio up: open pull gives up at once, touches nothing", function()
-    mtk({}, false)
+-- MTK radio. A boot where Nickel never used the radio: KOReader's enable-wifi.sh
+-- alone would panic the kernel, so the plugin starts the radio first, unless
+-- something else is already working on it.
+local function newerOnServer()
+    server.digest1 = { timestamp = os.time() + 10, device_id = "X3", device = "Xteink", progress = "/body/new", percentage = 0.7 }
+end
+local function scriptStartTime()
+    local started_at
+    local real_restore = NetworkMgr.restoreWifiAsync
+    NetworkMgr.restoreWifiAsync = function(self) started_at = started_at or now real_restore(self) end
+    return function() NetworkMgr.restoreWifiAsync = real_restore return started_at end
+end
+
+scenario("MTK, radio started by Nickel: sync as usual, no start-up of our own", function()
+    mtk(radioUp())
+    newerOnServer()
     local p = newReader()
-    p:onReaderReady()
-    advance(1)
-    check(not lastLogHas("[script] started"), "no restore script started")
-    check(not lastLogHas("[net] disableWifi") and not lastLogHas("[kill]"), "no teardown for a job that started nothing")
-    check(Link.job == nil and #tasks == 0, "job over, timeout unscheduled")
-    check(Link.last and Link.last.detail == "radio not started", "status: " .. tostring(Link.last and Link.last.detail))
-    check(not NetworkMgr.pending_connection, "no pending connection flagged (kobo.koplugin reads it)")
+    p:onReaderReady() advance(30)
+    check(#radio.steps == 0, "no radio start-up steps")
+    check(lastLogHas("getProgress route=true"), "pulled")
 end)
 
-scenario("cold MTK boot, kobo.koplugin bringing the stack up: wait, start on BluetoothWifiReleased", function()
-    mtk({ ["/dev/stpbt"] = "char device" }, true) -- what the own check would see mid bring-up
+scenario("cold MTK boot, nothing else around: start the radio Nickel's way, then sync", function()
+    mtk()
+    newerOnServer()
+    local stop = scriptStartTime()
+    local p = newReader()
+    p:onReaderReady()
+    advance(40)
+    local started_at = stop()
+    local i_drv, i_loader, i_launcher = stepIndex("insmod"), stepIndex("wmt_loader"), stepIndex("launcher")
+    local i_unlock, i_on, i_wifi = stepIndex("0xDB9DB9"), stepIndex("7 9 1"), stepIndex("echo 1 >/dev/wmtWifi")
+    check(i_drv == 1 and i_drv < i_loader and i_loader < i_launcher and i_launcher < i_unlock and i_unlock < i_on and i_on < i_wifi,
+        "order: wmt_drv, loader, firmware daemon, handshake, Wi-Fi function on")
+    check(radio.steps[1]:find("/mt66xx/wmt_drv.ko", 1, true) ~= nil, "module from the platform's mt66xx folder: " .. tostring(radio.steps[1]))
+    check(stepIndex("wmt_cdev_bt.ko") == nil and #radio.steps == 8, "loader inserted the rest, nothing inserted twice (" .. #radio.steps .. " steps)")
+    check(lastLogHas("[show] (modal) Starting the radio for progress sync") and lastLogHas("[close] Starting the radio"), "box shown, then closed")
+    check(started_at and started_at >= 4.25, "Wi-Fi script only after the start-up (at " .. tostring(started_at) .. " s)")
+    check(lastLogHas("radio started in about"), "logged")
+    check(lastLogHas("getProgress route=true"), "pulled")
+    check(not wifi.modules, "wifi off at the end")
+end)
+
+scenario("cold MTK boot, kobo.koplugin starting the radio (Enable on startup): wait, start nothing ourselves", function()
+    mtk()
     local stack_ready = false
     package.loaded["src/kobo_bluetooth"] = { wifi_borrowed = true }
     package.loaded["src/lib/bluetooth/wmt_power"] = { bringing_up = true, isStackLoaded = function() return stack_ready end }
-    server.digest1 = { timestamp = os.time() + 10, device_id = "X3", device = "Xteink", progress = "/body/new", percentage = 0.7 }
-    local started_at
-    local real_restore = NetworkMgr.restoreWifiAsync
-    NetworkMgr.restoreWifiAsync = function(self) started_at = now real_restore(self) end
+    newerOnServer()
+    local stop = scriptStartTime()
     local p = newReader()
     p:onReaderReady()
     UIManager:scheduleIn(13.5, function()
+        mtk(radioUp())
         local wmt = package.loaded["src/lib/bluetooth/wmt_power"]
         wmt.bringing_up = false stack_ready = true
         package.loaded["src/kobo_bluetooth"].wifi_borrowed = false
         p:onBluetoothWifiReleased() -- the plugin's broadcast
     end)
     advance(60)
-    NetworkMgr.restoreWifiAsync = real_restore
-    check(started_at == 13.5, "script started on the event, not at the next poll (at " .. tostring(started_at) .. " s)")
+    local started_at = stop()
+    check(#radio.steps == 0, "no start-up of our own")
+    check(lastLogHas("waiting for kobo.koplugin to finish with the radio"), "waiting logged")
+    check(started_at == 13.5, "Wi-Fi script started on the event (at " .. tostring(started_at) .. " s)")
     check(lastLogHas("getProgress route=true"), "pulled")
-    check(not wifi.modules, "wifi off at the end")
 end)
 
-scenario("MTK, bring-up finished but failed (plugin says missing): Sync now explains", function()
-    mtk({}, false)
+scenario("kobo.koplugin installed, Bluetooth not on at startup: start the radio ourselves, its flags untouched", function()
+    mtk()
+    local kb = { wifi_borrowed = false }
+    local wmt = { bringing_up = false, isStackLoaded = function() return radio.launcher and radio.modules.wmt_cdev_bt == true end }
+    package.loaded["src/kobo_bluetooth"] = kb
+    package.loaded["src/lib/bluetooth/wmt_power"] = wmt
+    newerOnServer()
+    local p = newReader()
+    p:onReaderReady() advance(40)
+    check(stepIndex("echo 1 >/dev/wmtWifi") ~= nil, "radio started")
+    check(kb.wifi_borrowed == false and wmt.bringing_up == false, "kobo.koplugin's flags not touched")
+    check(lastLogHas("getProgress route=true"), "pulled")
+end)
+
+scenario("a Bluetooth tap during the start-up is only handled once the radio is up", function()
+    mtk()
+    local seen
+    local p = newReader()
+    p:onReaderReady()
+    -- what kobo.koplugin would look at when the tap is handled
+    UIManager:scheduleIn(1, function() seen = { launcher = radio.launcher, wifi_on = stepIndex("echo 1 >/dev/wmtWifi") ~= nil, at = now } end)
+    advance(40)
+    check(seen and seen.launcher and seen.wifi_on, "the tap saw a radio that is up, handshake done")
+    check(seen and seen.at >= 4.25, "and only after the start-up (at " .. tostring(seen and seen.at) .. " s)")
+end)
+
+scenario("another program working on the radio (wmt_loader): wait, then use what it left", function()
+    mtk()
+    radio.procs = { { pid = 5, cmdline = "/usr/bin/wmt_loader\0" } }
+    UIManager:scheduleIn(3, function() radio.procs = {} mtk(radioUp()) end)
+    local stop = scriptStartTime()
+    local p = newReader()
+    p:onReaderReady() advance(40)
+    local started_at = stop()
+    check(lastLogHas("waiting for wmt_loader to finish with the radio"), "waited for the loader")
+    check(#radio.steps == 0, "no start-up of our own")
+    check(started_at and started_at >= 3, "Wi-Fi script after it finished (at " .. tostring(started_at) .. " s)")
+end)
+
+scenario("KOReader's own enable-wifi.sh running, radio already up: wait for it", function()
+    mtk(radioUp())
+    radio.procs = { { pid = 6, cmdline = "/bin/sh\0./enable-wifi.sh\0" } }
+    UIManager:scheduleIn(2, function() radio.procs = {} end)
+    local stop = scriptStartTime()
+    local p = newReader()
+    p:onReaderReady() advance(40)
+    local started_at = stop()
+    check(lastLogHas("waiting for enable-wifi.sh"), "waited")
+    check(started_at and started_at >= 2, "started after it (at " .. tostring(started_at) .. " s)")
+end)
+
+scenario("Kobo's Bluetooth daemon running while the radio is down: give it 10 s, then start the radio", function()
+    mtk()
+    radio.procs = { { pid = 7, cmdline = "/usr/bin/mtkbtd\0" } }
+    local p = newReader()
+    p:onReaderReady() advance(9)
+    check(#radio.steps == 0 and lastLogHas("waiting for mtkbtd"), "waiting for it at first")
+    advance(40)
+    check(stepIndex("echo 1 >/dev/wmtWifi") ~= nil, "then started the radio")
+    check(lastLogHas("open sync done"), "and synced")
+end)
+
+scenario("Kobo's Bluetooth daemon with the radio up is not radio work", function()
+    mtk(radioUp())
+    radio.procs = { { pid = 7, cmdline = "/usr/bin/mtkbtd\0" }, { pid = 8, cmdline = "/usr/bin/wmt_launcher\0-p\0/lib/firmware\0" } }
+    local p = newReader()
+    p:onReaderReady() advance(30)
+    check(not lastLogHas("waiting for"), "no wait")
+    check(lastLogHas("[script] started by plugin"), "connected at once")
+end)
+
+scenario("start-up step hangs (chip loader): stopped at its limit, no handshake, no Wi-Fi script", function()
+    mtk()
+    radio.hang.loader = true
+    local p = newReader()
+    p:onReaderReady() advance(40)
+    check(stepIndex("0xDB9DB9") == nil, "no handshake")
+    check(lastLogHas("the chip loader still running after 10 s"), "time-out logged")
+    check(not lastLogHas("[script] started"), "no Wi-Fi script")
+    check(not lastLogHas("[net] disableWifi"), "no teardown")
+    check(lastLogHas("[close] Starting the radio"), "box closed")
+    check(Link.last and Link.last.detail == "radio did not start", "status: " .. tostring(Link.last and Link.last.detail))
+end)
+
+scenario("a module missing after the loader: stop before the handshake", function()
+    mtk()
+    radio.fail.wlan_drv_gen4m = true
+    local p = newReader()
+    p:onReaderReady() advance(40)
+    check(stepIndex("wlan_drv_gen4m.ko") ~= nil, "tried to insert it")
+    check(stepIndex("0xDB9DB9") == nil and lastLogHas("module wlan_drv_gen4m is not loaded"), "stopped before the handshake")
+    check(not lastLogHas("[script] started"), "no Wi-Fi script")
+end)
+
+scenario("the firmware daemon does not start: stop before the handshake", function()
+    mtk()
+    radio.fail.launcher = true
+    local p = newReader()
+    p:onReaderReady() advance(40)
+    check(stepIndex("0xDB9DB9") == nil and lastLogHas("the firmware daemon did not start"), "stopped before the handshake")
+end)
+
+scenario("a handshake write fails: stop, no Wi-Fi script", function()
+    mtk()
+    radio.fail["7 9 1"] = true
+    local p = newReader()
+    p:onReaderReady() advance(40)
+    check(stepIndex("echo 1 >/dev/wmtWifi") == nil, "Wi-Fi function not switched on")
+    check(not lastLogHas("[script] started"), "no Wi-Fi script")
+end)
+
+scenario("several slow steps: the whole start-up stops at 20 s", function()
+    mtk()
+    Radio.run = (function(run) return function(command, limit) now = now + 6 return run(command, limit) end end)(Radio.run)
+    local p = newReader()
+    p:onReaderReady() advance(60)
+    check(lastLogHas("over 20 s, not running"), "stopped by the overall limit")
+    check(not lastLogHas("[script] started"), "no Wi-Fi script")
+end)
+
+scenario("Sync now after a failed start-up says what else starts the radio", function()
+    mtk()
+    radio.hang.loader = true
+    local p = newReader()
+    p:onKOSyncWiFiSyncNow() advance(30)
+    check(lastLogHas("[show] Could not start the radio for Wi-Fi. Turn Wi-Fi on in Kobo's own software"), "without kobo.koplugin")
     package.loaded["src/kobo_bluetooth"] = { wifi_borrowed = false }
-    package.loaded["src/lib/bluetooth/wmt_power"] = { bringing_up = false, isStackLoaded = function() return false end }
-    local p = newReader()
-    p:onKOSyncWiFiSyncNow() advance(5)
-    check(lastLogHas("[show] Wi-Fi can't be turned on yet") and lastLogHas("Turn Bluetooth on"), "message says to turn Bluetooth on")
-    check(not lastLogHas("[script] started"), "no restore script started")
+    p:onKOSyncWiFiSyncNow() advance(60)
+    check(lastLogHas("[show] Could not start the radio for Wi-Fi. Turn Bluetooth on"), "with kobo.koplugin")
 end)
 
-scenario("MTK, plugin's stack check says ready: sync runs even without the own evidence", function()
-    mtk({}, false)
-    package.loaded["src/lib/bluetooth/wmt_power"] = { isStackLoaded = function() return true end }
-    server.digest1 = { timestamp = os.time() + 10, device_id = "X3", device = "Xteink", progress = "/body/new", percentage = 0.7 }
-    local p = newReader()
-    p:onReaderReady() advance(30)
-    check(lastLogHas("getProgress route=true"), "pulled")
-end)
-
-scenario("MTK without kobo.koplugin: device node plus firmware daemon counts as ready", function()
-    mtk({ ["/dev/stpbt"] = "char device" }, true)
-    server.digest1 = { timestamp = os.time() + 10, device_id = "X3", device = "Xteink", progress = "/body/new", percentage = 0.7 }
-    local p = newReader()
-    p:onReaderReady() advance(30)
-    check(lastLogHas("getProgress route=true"), "pulled")
-end)
-
-scenario("MTK without kobo.koplugin: the plugin's ready marker counts as ready", function()
-    mtk({ ["/tmp/kobo.koplugin-wmt-stack-ready"] = "file" }, false)
-    local p = newReader()
-    p:onReaderReady() advance(30)
-    check(lastLogHas("[script] started by plugin"), "script started")
-end)
-
-scenario("MTK without kobo.koplugin: device node but no firmware daemon is not ready", function()
-    mtk({ ["/dev/stpbt"] = "char device" }, false)
-    local p = newReader()
-    p:onKOSyncWiFiSyncNow() advance(5)
-    check(not lastLogHas("[script] started"), "no restore script started")
-    check(lastLogHas("Turn Wi-Fi on in Kobo's own software"), "message for a device without the Bluetooth plugin")
-end)
-
-scenario("cold MTK boot, sleep with a book: suspend released at once, close position stays queued", function()
-    mtk({}, false)
+scenario("sleep on a cold boot: radio started without a box, push goes out, suspend released", function()
+    mtk()
     local p = newReader()
     p:onPageUpdate(2)
     Device.screen_saver_mode = true
     p:onSuspend()
-    advance(1)
-    check(Device.suspend_calls[1] == 50 and Device.suspend_calls[2] == 1, "suspend held, then released right away")
-    check(Link.last and Link.last.kind == "sleep" and Link.last.detail == "radio not started", "status: " .. tostring(Link.last and Link.last.detail))
-    Device.screen_saver_mode = false
-    p:onResume()
+    advance(60)
+    check(stepIndex("echo 1 >/dev/wmtWifi") ~= nil, "radio started")
+    check(not lastLogHas("Starting the radio for progress sync"), "no box on the sleep screen")
+    check(lastLogHas("updateProgress route=true"), "pushed")
+    check(Device.suspend_calls[#Device.suspend_calls] == 1, "suspend released")
+end)
+
+scenario("close offline on a cold boot when the start-up fails: position stays queued", function()
+    mtk()
+    radio.hang.loader = true
+    local p = newReader()
+    p:onPageUpdate(2)
     p:onCloseDocument()
-    check(#queue == 1, "close position queued for later")
-    check(Link.last and Link.last.detail == "radio not started, queued", "status: " .. tostring(Link.last and Link.last.detail))
-    advance(5)
-    check(Link.last and Link.last.kind == "wake" and Link.last.detail == "radio not started", "wake sync gave up too")
-    check(#queue == 1 and not lastLogHas("[script] started"), "still queued, nothing started")
+    advance(30)
+    check(#queue == 1, "still queued")
+    check(Link.last and Link.last.detail == "radio did not start, queued", "status: " .. tostring(Link.last and Link.last.detail))
+end)
+
+scenario("second sync of the boot: radio already up from our start-up, no second start-up", function()
+    mtk()
+    local p = newReader()
+    p:onReaderReady() advance(40)
+    local steps = #radio.steps
+    p:onResume() advance(now + 40)
+    check(steps > 0 and #radio.steps == steps, "start-up ran once")
 end)
 
 scenario("a job that only waited and timed out tears nothing down", function()
@@ -449,14 +621,25 @@ scenario("a job that only waited and timed out tears nothing down", function()
     check(not lastLogHas("[net] disableWifi") and not lastLogHas("[kill]"), "no disable-wifi.sh, no kill")
 end)
 
+scenario("radio work found in /proc: scripts, loader, insmod; the Bluetooth daemon only while the radio is down", function()
+    local job = {}
+    local function work(procs, down) radio.procs = procs return Link.radioWork(job, down) end
+    check(work({ { pid = 1, cmdline = "/bin/sh\0./disable-wifi.sh\0" } }, false) == "disable-wifi.sh", "disable-wifi.sh")
+    check(work({ { pid = 1, cmdline = "/bin/sh\0./obtain-ip.sh\0" } }, false) == "obtain-ip.sh", "obtain-ip.sh")
+    check(work({ { pid = 1, cmdline = "insmod\0/drivers/x/mt66xx/wmt_drv.ko\0" } }, false) == "insmod", "insmod")
+    check(work({ { pid = 1, cmdline = "/usr/bin/mtkbtd\0" } }, false) == nil, "mtkbtd ignored while the radio is up")
+    check(work({ { pid = 1, cmdline = "/usr/bin/mtkbtd\0" }, { pid = 2, cmdline = "/usr/bin/wmt_loader\0" } }, true) == "wmt_loader", "the loader wins over mtkbtd")
+    check(work({ { pid = 1, cmdline = "/usr/bin/wmt_launcher\0-p\0/lib/firmware\0" }, { pid = 2, cmdline = "./reader.lua\0" } }, true) == nil, "the running firmware daemon is not work")
+end)
+
 scenario("isLauncherRunning finds wmt_launcher by program name in /proc", function()
     local real_dir, real_open = lfs_stub.dir, io.open
     local cmdlines = { ["/proc/7/cmdline"] = "/bin/sh\0-c\0x\0", ["/proc/42/cmdline"] = "wmt_launcher\0-p\0/lib/firmware\0" }
     lfs_stub.dir = function() local names, i = { ".", "self", "7", "42" }, 0 return function() i = i + 1 return names[i] end end
     io.open = function(path) local s = cmdlines[path] if not s then return nil end return { read = function() return s end, close = function() end } end
-    local found = real_isLauncherRunning()
+    local found = real.isLauncherRunning()
     cmdlines["/proc/42/cmdline"] = "/usr/bin/wmt_loader\0"
-    local not_found = real_isLauncherRunning()
+    local not_found = real.isLauncherRunning()
     lfs_stub.dir, io.open = real_dir, real_open
     check(found == true, "found without a path")
     check(not_found == false, "wmt_loader is not the launcher")
