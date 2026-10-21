@@ -86,9 +86,22 @@ event, and what happened ("pushed", "pulled", "not pushed: in sync",
   while KOReader's *Auto restore Wi-Fi* script is still running, or while the
   Bluetooth part of [kobo.koplugin](https://github.com/OGKevin/kobo.koplugin)
   (my fork's 0.4.1-touch.6 or later) has the Wi-Fi function borrowed for its
-  chip start-up (`wifi_borrowed`, about 2 s after wake). Older kobo.koplugin
-  builds ran the full restore script at wake-up and then killed Wi-Fi
-  underneath everyone; update if you use it.
+  chip start-up (`wifi_borrowed`, about 2 s after wake, about 13 s on a boot
+  where it starts the radio). Older kobo.koplugin builds ran the full restore
+  script at wake-up and then killed Wi-Fi underneath everyone; update if you
+  use it.
+- **MTK Kobos right after a reboot.** On a Clara BW, Clara Colour or Libra
+  Colour, KOReader's Wi-Fi script relies on Kobo's own software having started
+  the radio earlier in the boot. Reboot with Wi-Fi and Bluetooth off there, go
+  straight to KOReader, and nothing has: turning Wi-Fi on then crashes and
+  reboots the device (KOReader's own Wi-Fi menu included). The plugin checks
+  first. It waits while
+  [kobo.koplugin](https://github.com/glaucon1984/kobo.koplugin) (my fork's
+  0.4.1-touch.9 or later, e.g. with *Enable on startup*) is starting the radio,
+  and otherwise skips the sync ("radio not started") instead of starting
+  Wi-Fi. A position from closing a book stays queued for the next sync.
+  Turning Bluetooth on with that plugin starts the radio safely; after that,
+  syncs work for the rest of the boot.
 - **A push never undoes reading done elsewhere.** The plugin records when a
   page was last turned in each book (per-book setting, survives reopening) and
   hands that time to KOSync as well, which fixes KOSync's own forward/backward
@@ -135,7 +148,8 @@ after the power press; wake pull done 7 to 11 s after waking.
 `tests/harness.lua` fakes the KOReader pieces the plugin touches (clock,
 UIManager tasks, NetworkMgr, Device, KOSync, the sync server) and replays the
 event sequences: open, sleep, wake during sleep, Wi-Fi timeout, offline close,
-USB mass storage, foreign Wi-Fi scripts, the push guard and the queue rules.
+USB mass storage, foreign Wi-Fi scripts, the push guard, the queue rules and
+the MTK radio check (Bluetooth plugin starting the radio, or nobody).
 
 ```bash
 luajit tests/harness.lua kosyncwifi.koplugin/main.lua

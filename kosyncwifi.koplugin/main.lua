@@ -229,8 +229,8 @@ end
 -- other plugins use it too, so we need to see it and, if orphaned, stop it).
 -- ---------------------------------------------------------------------------
 
--- pid of a running restore-wifi-async.sh, or nil.
-local function findScript()
+-- pid of the first process whose command line passes test(cmdline), or nil.
+local function findProcess(test)
     local ok, res = pcall(function()
         for pid in lfs.dir("/proc") do
             if pid:match("^%d+$") then
@@ -238,7 +238,7 @@ local function findScript()
                 if f then
                     local cmdline = f:read("*a") or ""
                     f:close()
-                    if cmdline:find(RESTORE_SCRIPT, 1, true) then
+                    if test(cmdline) then
                         return tonumber(pid)
                     end
                 end
@@ -246,6 +246,20 @@ local function findScript()
         end
     end)
     if ok then return res end
+end
+
+-- pid of a running restore-wifi-async.sh, or nil.
+local function findScript()
+    return findProcess(function(cmdline) return cmdline:find(RESTORE_SCRIPT, 1, true) end)
+end
+
+-- MediaTek's firmware daemon, by program name (Nickel, the Bluetooth daemon
+-- and kobo.koplugin all start it, not necessarily by the same path).
+local function isLauncherRunning()
+    return findProcess(function(cmdline)
+        local program = cmdline:match("^[^%z]*") or ""
+        return program:match("[^/]*$") == "wmt_launcher"
+    end) ~= nil
 end
 
 local function killScript(pid)
@@ -268,6 +282,7 @@ local Link = {
     shutting_down = false,
     findScript = findScript, -- replaceable for tests
     killScript = killScript,
+    isLauncherRunning = isLauncherRunning,
 }
 
 function Link.isUp()
@@ -308,8 +323,10 @@ function Link._complete(job, ok)
         end
     end
 
-    -- Tear Wi-Fi down if we were the ones who brought it up.
-    if job.we_turned_it_on then
+    -- Tear Wi-Fi down if we were the ones who brought it up. A job that only
+    -- ever waited started nothing: running disable-wifi.sh then would write to
+    -- the radio while the Bluetooth plugin may still be bringing it up.
+    if job.we_turned_it_on and job.launched then
         if not ok then
             -- Failed attempt: make sure nothing is left half-up or half-running.
             logger.info("KOSyncWiFi: cleaning up the failed Wi-Fi attempt")
@@ -329,7 +346,7 @@ function Link._complete(job, ok)
     if not ok then
         for _, entry in ipairs(job.entries) do
             if entry.on_connected then
-                local call_ok, err = pcall(entry.on_connected, false)
+                local call_ok, err = pcall(entry.on_connected, false, job.failure)
                 if not call_ok then
                     logger.err("KOSyncWiFi: on_connected failed:", err)
                 end
@@ -390,9 +407,61 @@ local function bluetoothHasWifi()
     return type(kb) == "table" and kb.wifi_borrowed == true
 end
 
+-- MTK Kobos (Clara BW / Colour, Libra Colour): KOReader's enable-wifi.sh only
+-- inserts the radio modules and runs the chip handshake. It relies on Nickel
+-- having run MediaTek's chip detection (wmt_loader) and firmware daemon
+-- (wmt_launcher) earlier in the boot. On a boot where Nickel never used Wi-Fi
+-- or Bluetooth nothing has, and the handshake panics the kernel (Clara BW,
+-- KOReader v2026.07.2). kobo.koplugin (0.4.1-touch.9 or later) brings the
+-- stack up the way Nickel does when it turns Bluetooth on, and leaves a
+-- marker in /tmp; until someone has, Wi-Fi must not be started.
+local WMT_STACK_READY_MARKER = "/tmp/kobo.koplugin-wmt-stack-ready"
+local WMT_BT_DEVICE = "/dev/stpbt"
+
+local function isMTK()
+    return Device.isKobo ~= nil and Device:isKobo() and Device.isMTK ~= nil and Device:isMTK() or false
+end
+
+-- "ready", "coming" (the Bluetooth plugin holds the Wi-Fi function or is
+-- bringing the stack up: wait for it) or "missing" (nothing has brought the
+-- radio up since boot). The plugin's own stack check is used when it is
+-- loaded; it is internal to that plugin, so the same rule is applied here
+-- when it is not: its marker, or the device node plus a running firmware
+-- daemon. The node alone means nothing: it appears as soon as the modules are
+-- inserted, before the chip is detected.
+function Link.radioState()
+    if bluetoothHasWifi() then
+        return "coming"
+    end
+    if not isMTK() then
+        return "ready"
+    end
+    local wmt = package.loaded["src/lib/bluetooth/wmt_power"]
+    if type(wmt) == "table" then
+        if wmt.bringing_up == true then
+            return "coming"
+        end
+        if type(wmt.isStackLoaded) == "function" then
+            local ok, loaded = pcall(wmt.isStackLoaded)
+            if ok then
+                return loaded and "ready" or "missing"
+            end
+        end
+    end
+    if lfs.attributes(WMT_STACK_READY_MARKER, "mode") then
+        return "ready"
+    end
+    if lfs.attributes(WMT_BT_DEVICE, "mode") and Link.isLauncherRunning() then
+        return "ready"
+    end
+    return "missing"
+end
+
 -- Starts the connection, once nothing else is in the middle of a Wi-Fi
 -- start-up: KOReader's own "Auto restore Wi-Fi" script at wake, or the
--- Bluetooth plugin borrowing the Wi-Fi function for a couple of seconds.
+-- Bluetooth plugin borrowing the Wi-Fi function for a couple of seconds
+-- (about 13 s on a boot where it brings the radio stack up). Gives up at once
+-- when nobody has brought the radio up and nobody is about to.
 function Link._launch(job)
     if Link.job ~= job then return end
 
@@ -403,11 +472,19 @@ function Link._launch(job)
         return
     end
 
-    if Link.findScript() or bluetoothHasWifi() then
+    local radio = Link.radioState()
+    if Link.findScript() or radio == "coming" then
         logger.dbg("KOSyncWiFi: waiting for another Wi-Fi start-up to finish")
         UIManager:scheduleIn(1, Link._launch, job)
         return
     end
+    if radio == "missing" then
+        logger.warn("KOSyncWiFi: not starting Wi-Fi: nothing has brought the radio up since boot")
+        job.failure = "radio"
+        Link._complete(job, false)
+        return
+    end
+    job.launched = true
 
     local method = job.settings.method
     if method == "silent" and not (Device:hasWifiRestore() and NetworkMgr.restoreWifiAsync) then
@@ -495,6 +572,11 @@ function Link.shutdown()
     if job then
         logger.info("KOSyncWiFi: aborting the Wi-Fi job, KOReader is closing")
         Link._complete(job, false)
+        if not job.launched then
+            -- It was waiting for someone else's restore script, which blocks
+            -- the USB export just the same.
+            Link.killScript()
+        end
     end
 end
 
@@ -707,14 +789,32 @@ function KOSyncWiFi:doSync(opts)
     return table.concat(parts, ", "), all_ok, pushed, prompt_shown
 end
 
+-- Status-line reason for a sync that got no Wi-Fi (see Link.radioState).
+local function noWifiText(reason)
+    if reason == "radio" then
+        return _("radio not started")
+    end
+    return _("no Wi-Fi")
+end
+
+-- What to do about it: with the Bluetooth plugin, turning Bluetooth on brings
+-- the radio up; without it, only Kobo's own software can, before KOReader starts.
+local function radioMissingMessage()
+    if package.loaded["src/kobo_bluetooth"] ~= nil then
+        return _("Wi-Fi can't be turned on yet: the radio has not been started since the reboot. Turn Bluetooth on, then sync again.")
+    end
+    return _("Wi-Fi can't be turned on yet: the radio has not been started since the reboot. Turn Wi-Fi on in Kobo's own software before starting KOReader.")
+end
+
 -- Bring Wi-Fi up, sync, bring it down.
 function KOSyncWiFi:runSync(kind, opts, on_finished)
     logger.info("KOSyncWiFi: sync requested:", kind)
-    Link.request(self.settings, function(ok)
+    Link.request(self.settings, function(ok, reason)
         if not ok then
-            Link.setLast(kind, false, _("no Wi-Fi"))
+            Link.setLast(kind, false, noWifiText(reason))
             if opts.manual then
-                UIManager:show(InfoMessage:new{ text = _("Could not connect to Wi-Fi."), timeout = 3 })
+                local text = reason == "radio" and radioMissingMessage() or _("Could not connect to Wi-Fi.")
+                UIManager:show(InfoMessage:new{ text = text, timeout = reason == "radio" and 6 or 3 })
             end
             return
         end
@@ -817,9 +917,9 @@ function KOSyncWiFi:onCloseDocument()
 
     local creds = loadKOSyncCreds()
     local settings = self.settings
-    Link.request(settings, function(up)
+    Link.request(settings, function(up, reason)
         if not up then
-            Link.setLast("close", false, _("no Wi-Fi, queued"))
+            Link.setLast("close", false, reason == "radio" and _("radio not started, queued") or _("no Wi-Fi, queued"))
             return
         end
         local sent, dropped, titles = drainQueue(creds)
@@ -855,9 +955,9 @@ function KOSyncWiFi:onSuspend()
         logger.info("KOSyncWiFi: holding suspend for up to", budget, "s for the sleep sync")
         Device:rescheduleSuspend(budget)
 
-        Link.request(self.settings, function(ok)
+        Link.request(self.settings, function(ok, reason)
             if not ok then
-                Link.setLast("sleep", false, _("no Wi-Fi"))
+                Link.setLast("sleep", false, noWifiText(reason))
                 return
             end
             -- If we were woken up meanwhile, also pull (acts as the wake sync).
@@ -976,6 +1076,17 @@ function KOSyncWiFi:onResume()
         UIManager:scheduleIn(1, function()
             self:runSync("wake", {})
         end)
+    end
+end
+
+-- kobo.koplugin let go of the Wi-Fi function (and, on a cold boot, finished
+-- bringing the radio up): start a waiting job now instead of at its next
+-- one-second check. Returning nothing lets other plugins see the event too.
+function KOSyncWiFi:onBluetoothWifiReleased()
+    local job = Link.job
+    if job and not job.launched then
+        UIManager:unschedule(Link._launch)
+        UIManager:nextTick(Link._launch, job)
     end
 end
 
