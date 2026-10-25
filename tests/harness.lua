@@ -19,6 +19,7 @@ function UIManager:show(w) say("  [show]" .. (w.modal and " (modal)" or ""), w.t
 function UIManager:close(w) say("  [close]", w.text or "?") if self.top == w then self.top = nil end end
 function UIManager:getTopmostVisibleWidget() return self.top end
 function UIManager:forceRePaint() end
+function UIManager:flushSettings() say("  [flush settings]") end
 function UIManager:setDirty(w, t) say("  [refresh]", t) end
 function UIManager:getElapsedTimeSinceBoot() return now end
 local function advance(to)
@@ -47,6 +48,11 @@ local function startScript(owner)
     say("  [script] started by", owner, "pid", wifi.script.pid)
 end
 local function tickWifi()
+    -- PocketBook: the firmware joined the network by itself after the aborted connect call
+    if wifi.autoconnect_at and now >= wifi.autoconnect_at then
+        wifi.autoconnect_at = nil wifi.modules = true wifi.address = true wifi.route = true
+        say("  [net] firmware joined the network by itself")
+    end
     local s = wifi.script
     if not s then return end
     local age = now - s.started
@@ -80,6 +86,19 @@ function NetworkMgr:connectivityCheck(iter, cb)
     end
 end
 function NetworkMgr:enableWifi() error("standard method not expected in this harness") end
+-- PocketBook's turnOnWifi blocks (inkview NetConnect) and leaves a connected link behind.
+-- wifi.aborted models the connect call giving up while the firmware puts the device to sleep: the radio is on and the
+-- firmware joins the network by itself after wifi.autoconnect_delay seconds (nil: never).
+function NetworkMgr:turnOnWifi()
+    say("  [net] turnOnWifi (blocking)")
+    if wifi.never then return end
+    if wifi.aborted then
+        say("  [net] NetConnect failed (aborted)")
+        if wifi.autoconnect_delay then wifi.autoconnect_at = now + wifi.autoconnect_delay end
+        return
+    end
+    wifi.modules = true wifi.address = true wifi.route = true
+end
 
 -- ---- fake Device -------------------------------------------------------------
 local Device = { screen_saver_mode = false, model = "Kobo_clarabw", suspend_calls = {},
@@ -145,7 +164,7 @@ end
 local stubs = {
     ["datastorage"] = { getSettingsDir = function() return "/tmp" end },
     ["device"] = Device,
-    ["dispatcher"] = { registerAction = function() end },
+    ["dispatcher"] = { registerAction = function(_, name) say("  [dispatcher] registered", name) end },
     ["ui/event"] = { new = function(_, name) return { name = name } end },
     ["ui/widget/infomessage"] = { new = function(_, o) return o end },
     ["luasettings"] = { open = function() return { readSetting = function() return kosync.settings end } end },
@@ -185,6 +204,12 @@ local menu = { registerToMainMenu = function() end }
 -- scheduled task: whatever is scheduled meanwhile runs only afterwards.
 local lfs_stub = stubs["libs/libkoreader-lfs"]
 local Radio = Plugin._Radio
+local Blocking = Plugin._Blocking
+Blocking.sleep = function(s) now = now + s end -- blocks in the real plugin: move the clock, run no task
+Blocking.netagent = function(args)
+    say("  [netagent]", args) now = now + 2
+    if wifi.agent_connects then wifi.modules = true wifi.address = true wifi.route = true end
+end
 local real = { isLauncherRunning = Link.isLauncherRunning, listProcesses = Link.listProcesses }
 local radio
 local function yes() return true end
@@ -255,6 +280,7 @@ local function scenario(name, fn)
     NetworkMgr.wifi_was_on = true NetworkMgr.pending_connection = false NetworkMgr.pending_connectivity_check = false
     gsettings.wifi_was_on = true Device.screen_saver_mode = false Device.suspend_calls = {}
     Link.shutting_down = false Link.job = nil Link.last = nil doc_settings_store = {}
+    Device.isPocketBook = nil
     resetRadio()
     fn()
 end
@@ -1116,6 +1142,203 @@ scenario("USB mass storage during our Wi-Fi start: the real stop runs before KOR
     check(sent(signals, "TERM 600") and sent(signals, "TERM 601"), "restore script and obtain-ip.sh stopped")
     check(lastLogHas("[net] disableWifi"), "then Wi-Fi turned off")
     check(Link.job == nil and #queue == 1, "job aborted, position still queued")
+end)
+
+-- ---- PocketBook: the firmware manages sleep and power off --------------------
+-- The Suspend / Exit events cannot be held there, so the sync runs blocking
+-- inside them: queue the position, connect, send the queue, disconnect.
+local function pocketbook() Device.isPocketBook = yes end
+
+scenario("PocketBook sleep after reading: queue, blocking connect, send, Wi-Fi off, notice on wake", function()
+    pocketbook()
+    local p = newReader()
+    p:onReaderReady() advance(30)
+    server.digest1 = { timestamp = os.time() - 100, device_id = "X3", device = "Xteink", progress = "/body/old", percentage = 0.4 }
+    p:onPageUpdate(2)
+    local pending = #tasks
+    p:onSuspend()
+    check(lastLogHas("sync requested: sleep (blocking)"), "blocking sleep sync")
+    check(lastLogHas("[net] turnOnWifi (blocking)"), "connected synchronously")
+    check(lastLogHas("update_progress (queue item)"), "queued position sent")
+    check(#queue == 0, "queue empty")
+    check(lastLogHas("[net] disableWifi"), "Wi-Fi off again")
+    check(Link.last and Link.last.kind == "sleep" and Link.last.ok, "status: sleep ok, " .. tostring(Link.last and Link.last.detail))
+    check(#tasks == pending, "nothing scheduled for later")
+    check(p.wake_notice ~= nil, "notice kept for wake-up")
+    p:onResume() advance(31)
+    check(lastLogHas("Progress pushed at"), "notice shown on wake")
+    check(p.wake_notice == nil, "notice cleared")
+end)
+
+scenario("PocketBook sleep: nothing new since the last push is skipped, a page turn makes it run again", function()
+    pocketbook()
+    local p = newReader()
+    p:onReaderReady() advance(30)
+    p:onPageUpdate(2)
+    p:onKOSyncWiFiSyncNow() advance(60)
+    check(lastLogHas("manual sync done"), "manual push went out")
+    p:onSuspend()
+    check(lastLogHas("sleep sync: nothing new to push"), "sleep skipped: the server has this position")
+    check(#queue == 0 and not lastLogHas("turnOnWifi"), "no queue, no connection")
+    p:onPageUpdate(3)
+    p:onSuspend()
+    check(lastLogHas("sync requested: sleep (blocking)"), "after a page turn the sleep sync runs")
+    check(Link.last.kind == "sleep" and Link.last.ok, "and succeeds")
+end)
+
+scenario("PocketBook sleep before any page was turned: nothing happens", function()
+    pocketbook()
+    local p = newReader()
+    p:onReaderReady() advance(30)
+    p:onSuspend()
+    check(lastLogHas("sleep sync: nothing new to push"), "skipped")
+    check(#queue == 0 and not lastLogHas("turnOnWifi"), "no queue, no connection")
+end)
+
+scenario("PocketBook sleep, Wi-Fi fails: position stays queued, radio off, sent at wake", function()
+    pocketbook()
+    local p = newReader()
+    p:onReaderReady() advance(30)
+    p:onPageUpdate(2)
+    wifi.never = true
+    p:onSuspend()
+    check(#queue == 1, "position queued")
+    check(Link.last.kind == "sleep" and not Link.last.ok, "status: sleep failed, " .. tostring(Link.last.detail))
+    check(lastLogHas("[net] disableWifi"), "radio turned off after the failed attempt")
+    check(p.wake_notice == nil, "no notice")
+    wifi.never = false
+    p:onResume() advance(70)
+    check(#queue == 0, "queue sent at wake")
+end)
+
+scenario("PocketBook sleep: the connect call is aborted by the firmware, which then joins the network itself", function()
+    pocketbook()
+    local p = newReader()
+    p:onReaderReady() advance(30)
+    p:onPageUpdate(2)
+    wifi.aborted = true wifi.autoconnect_delay = 3
+    p:onSuspend()
+    check(lastLogHas("NetConnect failed (aborted)"), "connect call aborted")
+    check(lastLogHas("firmware joined the network by itself"), "firmware joined the network")
+    check(not lastLogHas("[netagent]"), "no netagent needed")
+    check(lastLogHas("update_progress (queue item)") and #queue == 0, "position sent")
+    check(Link.last.ok and lastLogHas("Wi-Fi is up after 3 s"), "status ok after 3 s: " .. tostring(Link.last.detail))
+end)
+
+scenario("PocketBook sleep: aborted connect and no network after 4 s -> netagent connect, then sent", function()
+    pocketbook()
+    local p = newReader()
+    p:onReaderReady() advance(30)
+    p:onPageUpdate(2)
+    wifi.aborted = true wifi.agent_connects = true
+    p:onSuspend()
+    check(lastLogHas("[netagent] connect"), "netagent asked to connect")
+    check(lastLogHas("update_progress (queue item)") and #queue == 0, "position sent")
+    check(Link.last.ok, "status ok")
+    check(lastLogHas("[net] disableWifi"), "Wi-Fi off again")
+end)
+
+scenario("PocketBook sleep: aborted connect, netagent does not help -> queued after the 10 s limit", function()
+    pocketbook()
+    local p = newReader()
+    p:onReaderReady() advance(30)
+    p:onPageUpdate(2)
+    wifi.aborted = true
+    local t0 = os.time()
+    p:onSuspend()
+    check(lastLogHas("[netagent] connect"), "netagent asked once")
+    check(#queue == 1 and not Link.last.ok, "queued, status failed")
+    local took = os.time() - t0
+    check(took >= 10 and took <= 14, "gave up after " .. took .. " s")
+end)
+
+scenario("PocketBook sleep: another device moved on since -> queued position dropped, no notice", function()
+    pocketbook()
+    local p = newReader()
+    p:onReaderReady() advance(30)
+    p:onPageUpdate(2)
+    server.digest1 = { timestamp = os.time() + 100, device_id = "X3", device = "Xteink", progress = "/body/new", percentage = 0.7 }
+    p:onSuspend()
+    check(lastLogHas("Xteink is ahead"), "server checked first")
+    check(#queue == 0 and not lastLogHas("update_progress (queue item)"), "dropped, not sent")
+    check(p.wake_notice == nil, "no notice")
+end)
+
+scenario("PocketBook sleep while a Wi-Fi job is already running: queued, that job sends it", function()
+    pocketbook()
+    local p = newReader()
+    p:onReaderReady() advance(1)
+    p:onPageUpdate(2)
+    p:onSuspend()
+    check(lastLogHas("joining the running Wi-Fi job"), "joined the open job")
+    check(not lastLogHas("turnOnWifi"), "no blocking connect")
+    advance(30)
+    check(#queue == 0, "queue sent by that job")
+end)
+
+scenario("PocketBook: the start-up Suspend before the book is ready does nothing", function()
+    pocketbook()
+    local p = newReader()
+    p:onSuspend()
+    check(not lastLogHas("turnOnWifi") and #queue == 0 and Link.last == nil, "nothing happens before ReaderReady")
+end)
+
+scenario("PocketBook power off with a book open: settings flushed, pushed before KOReader quits, the close queues nothing more", function()
+    pocketbook()
+    local p = newReader()
+    p:onReaderReady() advance(30)
+    p:onPageUpdate(2)
+    p:onPowerOff()
+    check(lastLogHas("[flush settings]"), "settings flushed first")
+    check(lastLogHas("sync requested: exit (blocking)"), "blocking exit sync")
+    check(lastLogHas("update_progress (queue item)"), "position sent")
+    check(lastLogHas("[net] disableWifi"), "Wi-Fi off")
+    check(Link.shutting_down, "then marked as shutting down")
+    check(Link.last.kind == "exit" and Link.last.ok, "status: exit ok")
+    p:onClose()
+    p:onCloseDocument()
+    check(#queue == 0, "nothing queued at the close that follows")
+    check(not lastLogHas("sync requested: close"), "no second sync")
+end)
+
+scenario("PocketBook power off, Wi-Fi fails: position queued for the next start", function()
+    pocketbook()
+    local p = newReader()
+    p:onReaderReady() advance(30)
+    p:onPageUpdate(2)
+    wifi.never = true
+    p:onClose()
+    check(#queue == 1, "queued")
+    check(Link.last.kind == "exit" and not Link.last.ok, "status: exit failed")
+    p:onCloseDocument()
+    check(#queue == 1, "not queued twice")
+end)
+
+scenario("PocketBook power off in the file manager with a queue: sent", function()
+    pocketbook()
+    queue = { { document = "digest9", device_id = "DEV", progress = "/p", percentage = 0.2, last_page_turn = os.time(), metadata = { title = "Silo" } } }
+    local p = newFM()
+    p:onPowerOff()
+    check(lastLogHas("update_progress (queue item) digest9"), "queue sent")
+    check(#queue == 0, "queue empty")
+end)
+
+scenario("PocketBook power off with nothing new: no Wi-Fi", function()
+    pocketbook()
+    local p = newReader()
+    p:onReaderReady() advance(30)
+    p:onPowerOff()
+    check(not lastLogHas("turnOnWifi") and #queue == 0, "nothing to do, no connection")
+end)
+
+scenario("close offline with nothing new since the last push -> nothing queued", function()
+    local p = newReader()
+    p:onReaderReady() advance(30)
+    p:onPageUpdate(2)
+    p:onKOSyncWiFiSyncNow() advance(60)
+    p:onCloseDocument() advance(90)
+    check(#queue == 0, "nothing queued")
+    check(lastLogHas("nothing read here since the server last had this position"), "reason logged")
 end)
 
 print(table.concat(log, "\n"))

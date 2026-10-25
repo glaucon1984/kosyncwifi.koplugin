@@ -8,14 +8,16 @@ sync, then off again:
 |---|---|
 | Book opened | Wi-Fi up, queued positions sent, progress pulled, Wi-Fi down |
 | Device wakes up (book open) | same as above |
-| Device goes to sleep (book open) | sleep screen shows, the actual suspend is held for up to the time limit + 15 s, Wi-Fi up, progress pushed, Wi-Fi down, device sleeps |
+| Device goes to sleep (book open) | Kobo: sleep screen shows, the actual suspend is held for up to the time limit + 15 s, Wi-Fi up, progress pushed, Wi-Fi down, device sleeps. PocketBook: the push runs at once, blocking, before the firmware puts the device to sleep |
+| KOReader quits with a book open (PocketBook: *Power off* / *Exit* from KOReader's own menu) | the position is pushed at once, blocking, before KOReader is gone; queued if there is no Wi-Fi |
 | Book closed | push immediately if online; otherwise the position is queued and sent in the background once Wi-Fi is up |
 | Wake-up / sleep in the file manager | only if the offline queue has something to send |
 
 Wi-Fi is brought up silently with the same background script KOReader uses
 for *Auto restore Wi-Fi* (`restore-wifi-async.sh`), so nothing is drawn on the
-sleep screen and the reader never blocks. If Wi-Fi was already on before a
-sync, it is left on.
+sleep screen and the reader never blocks. On devices without that script
+(PocketBook) KOReader's normal non-interactive connection is used instead. If
+Wi-Fi was already on before a sync, it is left on.
 
 KOSync keeps doing the actual work: account, server, document checksum, the
 *forward* / *backward* prompts and the offline queue. This plugin only
@@ -127,7 +129,11 @@ event, and what happened ("pushed", "pulled", "not pushed: in sync",
   position.
 - **USB storage, power off, reboot, exit.** The "Close" / "Exit" broadcasts
   abort any running Wi-Fi job and stop the background script, which runs from
-  the onboard partition and would otherwise block the USB export.
+  the onboard partition and would otherwise block the USB export. On
+  PocketBook the open book's position is pushed first (see below).
+- **Nothing new, nothing sent.** A sleep or a close right after opening a
+  book, or after a sync, when no page was turned since the server last had
+  the book's position, starts no Wi-Fi at all.
 
 ## How the sleep hold works
 
@@ -142,13 +148,57 @@ cancels the suspend; the pending sync then runs as a wake sync (push + pull).
 Measured on a Kobo Clara BW: Wi-Fi up in 6 to 8 s, device asleep about 9 s
 after the power press; wake pull done 7 to 11 s after waking.
 
+## PocketBook
+
+On PocketBook the firmware, not KOReader, decides when the device sleeps or
+powers off. KOReader only hears about it (a *Suspend* event when it loses the
+screen, an *Exit* event when the firmware shuts down) and cannot hold either,
+so the Kobo approach of pushing the suspend out does not apply. There the
+plugin does the sync right inside the event, blocking, as soon as it arrives:
+
+1. the position goes into KOSync's offline queue first, so nothing is lost if
+   the device goes down halfway;
+2. Wi-Fi is turned on with KOReader's normal PocketBook connection. Once the
+   firmware is putting the device to sleep its connect call gives up at once
+   ("connecting aborted" in the log), but the radio is on and the firmware
+   joins the known network by itself a second or two later; if it has not
+   after 4 s, the plugin asks the firmware's own network tool
+   (`netagent connect`, what inkview runs internally) and waits up to 10 s in
+   all;
+3. the queue is sent, with the usual "server asked first" rule;
+4. Wi-Fi is disconnected again.
+
+The firmware draws its sleep screen only once the event has been handled, so
+the device stays awake for the sync: about 5 s on a PocketBook Era Lite, up
+to about 12 s when there is no network to join. It happens only when
+something was read since the server last had the book's position. The
+firmware draws its own sleep screen, so the "Progress pushed at HH:MM" notice
+is shown as a pop-up on wake-up instead (the sleep-screen box settings do not
+apply).
+
+**Power off from the button does not sync.** Holding the power button, awake
+or from standby, makes the firmware stop KOReader without telling it (in its
+raw input mode KOReader never receives the firmware's exit event), so nothing
+can run then: the position is sent at the next book open or wake-up at the
+latest. To have it sent before switching off, put the device in standby first
+(the sleep sync runs), or power off from KOReader itself: *Power off* under
+the main tab's *Exit* submenu asks to confirm, then the push runs before
+KOReader quits (the *close* toggle governs it). Launchers that deliver
+dispatcher actions to whatever widget is on top (SimpleUI's quick actions,
+for one) never reach KOReader's power-off confirmation, so a quick action
+cannot do this; use the menu. Wake-up, book open and book close work as on other devices,
+through KOReader's normal connection (the *Connect silently* setting has no
+effect on PocketBook).
+
 ## Requirements
 
 - KOReader 2026.07 or later (needs `KOSyncQueue`, the offline queue that came
-  with KOSync's 2026 rework). Tested on a Kobo Clara BW with v2026.07.1.
+  with KOSync's 2026 rework). Tested on a Kobo Clara BW (v2026.07.2) and a
+  PocketBook Era Lite (v2026.07.1).
 - A Kobo or other device with `restore-wifi-async.sh` for the silent mode
-  (anything with *Auto restore Wi-Fi* in the Network menu). Other devices can
-  use the "standard" connection mode (untested).
+  (anything with *Auto restore Wi-Fi* in the Network menu). PocketBook uses
+  KOReader's normal connection; other devices can use the "standard"
+  connection mode (untested).
 
 ## Tests
 
@@ -157,7 +207,8 @@ UIManager tasks, NetworkMgr, Device, KOSync, the sync server) and replays the
 event sequences: open, sleep, wake during sleep, Wi-Fi timeout, offline close,
 USB mass storage, foreign Wi-Fi scripts, the push guard, the queue rules and
 the MTK radio: starting it on a cold boot (order, time limits, failures), and
-waiting for the Bluetooth plugin or other programs working on it.
+waiting for the Bluetooth plugin or other programs working on it, and
+PocketBook's blocking sync at sleep and power off.
 
 ```bash
 luajit tests/harness.lua kosyncwifi.koplugin/main.lua

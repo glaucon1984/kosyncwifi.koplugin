@@ -13,6 +13,10 @@ the push can complete, then lets the device sleep immediately. Kobo's own
 suspend path kills Wi-Fi regardless, so a stuck connection can never block
 sleep.
 
+On PocketBook the firmware decides when the device sleeps or powers off and
+KOReader cannot hold it, so there the sleep push, and the push before KOReader
+quits, run blocking inside the event as soon as it arrives (see Blocking).
+
 KOSync's own "Automatic sync" must stay off (this plugin switches it off when
 it finds it on); KOSync still does the actual talking to the server, keeps the
 account and the forward/backward prompt settings, and owns the offline queue.
@@ -970,6 +974,76 @@ function Link.shutdown()
 end
 
 -- ---------------------------------------------------------------------------
+-- Blocking connection (PocketBook). There the firmware decides when the device
+-- sleeps or powers off: KOReader is told through the Suspend / Exit events but
+-- cannot hold either, and nothing scheduled for later is certain to run before
+-- the system is down. So the sync runs right inside the event, blocking; the
+-- firmware draws its sleep screen only once the event handler has returned
+-- (seen on an Era Lite), so the time is there.
+--
+-- NetworkMgr's turnOnWifi is already blocking on PocketBook: WiFiPower(1),
+-- then inkview's NetConnect. Once the firmware is putting the device to sleep,
+-- NetConnect gives up at once ("connecting aborted" in the log) but the radio
+-- is on, and the firmware joins the known network by itself a second or two
+-- later. If it has not after a few seconds, the firmware's own network tool is
+-- asked to connect, the way inkview runs it. The push itself takes about 1 s.
+-- ---------------------------------------------------------------------------
+
+local Blocking = {
+    AUTOCONNECT_WAIT = 4, -- seconds the firmware gets to join the network by itself
+    CONNECT_WAIT = 10,    -- seconds in all before giving up (plus one connect command)
+    POLL = 0.1,
+    NETAGENT = { "/ebrmain/bin/netagent", "/usr/bin/netagent", "netagent" },
+    sleep = Proc.sleep, -- replaceable for tests
+}
+
+function Blocking.isUp()
+    return NetworkMgr:isWifiOn() and NetworkMgr:isConnected()
+end
+
+-- Runs the firmware's network tool ("netagent connect" is what inkview itself
+-- runs inside NetConnect), blocking. Replaceable for tests.
+function Blocking.netagent(args)
+    for _, path in ipairs(Blocking.NETAGENT) do
+        if path:sub(1, 1) ~= "/" or lfs.attributes(path, "mode") then
+            logger.info("KOSyncWiFi: running", path, args)
+            return os.execute(path .. " " .. args)
+        end
+    end
+end
+
+-- Whether the firmware, not KOReader, manages sleep and power off.
+function Blocking.firmwareManagesPower()
+    return Device.isPocketBook ~= nil and Device:isPocketBook() or false
+end
+
+-- Connects and waits for a route. Returns up, ours (whether the connection is
+-- this call's to take down afterwards).
+function Blocking.connect()
+    if Blocking.isUp() then
+        return true, false
+    end
+    local ours = not NetworkMgr.pending_connection
+    if ours then
+        NetworkMgr:turnOnWifi()
+    end
+    local waited, agent_asked = 0, false
+    while waited < Blocking.CONNECT_WAIT do
+        if Blocking.isUp() then
+            return true, ours
+        end
+        if ours and not agent_asked and waited >= Blocking.AUTOCONNECT_WAIT and not NetworkMgr:isWifiOn() then
+            agent_asked = true
+            Blocking.netagent("connect")
+        else
+            Blocking.sleep(Blocking.POLL)
+            waited = waited + Blocking.POLL
+        end
+    end
+    return false, ours
+end
+
+-- ---------------------------------------------------------------------------
 -- The plugin
 -- ---------------------------------------------------------------------------
 
@@ -980,6 +1054,7 @@ local KOSyncWiFi = WidgetContainer:extend{
 KOSyncWiFi._Link = Link -- for tests
 KOSyncWiFi._Radio = Radio
 KOSyncWiFi._Proc = Proc
+KOSyncWiFi._Blocking = Blocking
 KOSyncWiFi._killScript = killScript
 
 function KOSyncWiFi:init()
@@ -1057,10 +1132,47 @@ function KOSyncWiFi:getLastPageTurn()
     return self.last_page_turn or 0
 end
 
+-- Page turns in this reader session are counted; markServerCurrent records
+-- the count at which the server was last known to hold this book's current
+-- position (or a newer one from another device): after a push, a pull, or
+-- the server check before either.
+function KOSyncWiFi:markServerCurrent()
+    self.synced_turns = self.turns or 0
+end
+
+-- Whether there is reading here the server has not seen.
+function KOSyncWiFi:hasNewReading()
+    if self:getLastPageTurn() == 0 then return false end
+    return (self.turns or 0) ~= self.synced_turns
+end
+
+-- Puts this book's position in KOSync's offline queue, with the time it was
+-- last read here. Returns whether it could be queued.
+function KOSyncWiFi:queuePosition(kosync)
+    local digest = kosync:getDocumentDigest()
+    if not digest then return false end
+    local KOSyncQueue = getQueue()
+    if not KOSyncQueue then
+        logger.warn("KOSyncWiFi: no KOSyncQueue module, cannot queue the position")
+        return false
+    end
+    KOSyncQueue:push({
+        document = digest,
+        metadata = kosync:getMetadata(),
+        progress = kosync:getLastProgress(),
+        percentage = kosync:getLastPercent(),
+        device = kosync.settings.kosync_hostname or Device.model,
+        device_id = kosync.device_id,
+        last_page_turn = self:getLastPageTurn(),
+    })
+    return true
+end
+
 function KOSyncWiFi:onPageUpdate(page)
     if page == nil or not self:inReader() then return end
     if self.last_page == page then return end
     self.last_page = page
+    self.turns = (self.turns or 0) + 1
     local now = os.time()
     self.last_page_turn = now
     local kosync = self:getKOSync()
@@ -1087,6 +1199,7 @@ function KOSyncWiFi:pushNow(interactive)
             local push, reason = shouldPush(server, kosync.device_id, progress, percentage, self:getLastPageTurn())
             if not push then
                 logger.info("KOSyncWiFi: not pushing:", reason)
+                self:markServerCurrent()
                 return true, T(_("not pushed: %1"), reason)
             end
         end
@@ -1100,6 +1213,7 @@ function KOSyncWiFi:pushNow(interactive)
     if after.count > before.count or (after.last and after.last ~= before.last) then
         return false, _("push failed, queued")
     end
+    self:markServerCurrent()
     return true, _("pushed")
 end
 
@@ -1121,10 +1235,12 @@ function KOSyncWiFi:pullNow()
         elseif state == "ok" then
             if server.device_id == kosync.device_id then
                 logger.info("KOSyncWiFi: not pulling: latest progress is this device's own")
+                self:markServerCurrent()
                 return _("latest is ours"), false
             end
             if samePosition(kosync:getLastProgress(), kosync:getLastPercent(), server.progress, server.percentage) then
                 logger.info("KOSyncWiFi: not pulling: in sync")
+                self:markServerCurrent()
                 return _("in sync"), false
             end
         end
@@ -1261,6 +1377,9 @@ function KOSyncWiFi:onCloseDocument()
     if not self.settings.enabled or not self.settings.on_close then return end
     local kosync = self:getKOSync()
     if not kosync then return end
+    if self.quit_synced then
+        return -- pushed, or queued, before KOReader quits (see syncBeforeQuit)
+    end
 
     if Link.isUp() and not Link.findScript() then
         logger.info("KOSyncWiFi: sync requested: close (online)")
@@ -1281,26 +1400,15 @@ function KOSyncWiFi:onCloseDocument()
         logger.info("KOSyncWiFi: close: no page was turned in this book here, nothing to push")
         return
     end
+    if not self:hasNewReading() then
+        logger.info("KOSyncWiFi: close: nothing read here since the server last had this position, nothing to push")
+        return
+    end
 
     -- Offline: queue the position (KOSync's own format, plus the time the
     -- book was last read here), then send the queue in the background once
     -- Wi-Fi is up. Nothing below may touch `self`, the reader is going away.
-    local digest = kosync:getDocumentDigest()
-    if not digest then return end
-    local KOSyncQueue = getQueue()
-    if not KOSyncQueue then
-        logger.warn("KOSyncWiFi: no KOSyncQueue module, cannot defer the close push")
-        return
-    end
-    KOSyncQueue:push({
-        document = digest,
-        metadata = kosync:getMetadata(),
-        progress = kosync:getLastProgress(),
-        percentage = kosync:getLastPercent(),
-        device = kosync.settings.kosync_hostname or Device.model,
-        device_id = kosync.device_id,
-        last_page_turn = self:getLastPageTurn(),
-    })
+    if not self:queuePosition(kosync) then return end
     if Link.shutting_down then
         logger.info("KOSyncWiFi: position queued, KOReader is closing")
         return
@@ -1333,6 +1441,10 @@ end
 -- Defer one tick so our rescheduleSuspend wins, then do the work.
 function KOSyncWiFi:onSuspend()
     if not self.settings.enabled or not self.settings.on_suspend then return end
+    if Blocking.firmwareManagesPower() then
+        self:syncBlocking("sleep")
+        return
+    end
     if not Device.rescheduleSuspend then return end
     local has_book = self:inReader() and self:getKOSync() ~= nil
     if not has_book and queueCount() == 0 then return end
@@ -1374,6 +1486,79 @@ function KOSyncWiFi:onSuspend()
             end
         end)
     end)
+end
+
+-- Sleep and power off where the firmware manages them (PocketBook): the
+-- position goes into KOSync's queue first, so nothing is lost if the system
+-- goes down halfway, then Wi-Fi comes up, the queue is sent and Wi-Fi goes
+-- down again, all before the event handler returns. In the file manager only
+-- the queue is sent. Returns whether anything was attempted.
+function KOSyncWiFi:syncBlocking(kind)
+    local kosync = self:getKOSync()
+    local has_book = kosync ~= nil and self:inReader()
+    local new_reading = has_book and self:hasNewReading()
+    if not new_reading and queueCount() == 0 then
+        if has_book then
+            logger.info("KOSyncWiFi:", kind, "sync: nothing new to push")
+        end
+        return false
+    end
+    if new_reading then
+        UIManager:flushSettings() -- the position is safe on disk first
+        self:queuePosition(kosync)
+    end
+    if Link.shutting_down and kind ~= "exit" then
+        logger.info("KOSyncWiFi:", kind, "sync: position queued, KOReader is closing")
+        return true
+    end
+    if Link.job then
+        -- Wi-Fi is already being brought up for something else: let that job
+        -- send the queue once it is up.
+        logger.info("KOSyncWiFi:", kind, "sync: position queued, joining the running Wi-Fi job")
+        self:runSync(kind, {})
+        return true
+    end
+
+    logger.info("KOSyncWiFi: sync requested:", kind, "(blocking)")
+    local started = os.time()
+    local up, ours = Blocking.connect()
+    local summary
+    if up then
+        logger.info("KOSyncWiFi: Wi-Fi is up after", os.time() - started, "s")
+        local sent, dropped, titles = drainQueue()
+        sent, dropped, titles = sent or 0, dropped or 0, titles or {}
+        summary = sent > 0 and T(_("queued sent: %1"), titlesText(titles)) or T(_("%1 queued sent"), sent)
+        if dropped > 0 then
+            summary = summary .. ", " .. T(_("%1 queued dropped"), dropped)
+        end
+        if has_book and queueCount() == 0 then
+            self:markServerCurrent()
+        end
+        Link.setLast(kind, queueCount() == 0, summary)
+        if sent > 0 and kind == "sleep" then
+            -- Shown on wake-up: the firmware owns the sleep screen.
+            self.wake_notice = T(_("Progress pushed at %1."), os.date("%H:%M"))
+        end
+    else
+        logger.warn("KOSyncWiFi: Wi-Fi did not come up, the position stays queued")
+        Link.setLast(kind, false, _("no Wi-Fi, queued"))
+    end
+    if ours and (not up or self.settings.wifi_off_after) then
+        logger.info("KOSyncWiFi: turning Wi-Fi off")
+        NetworkMgr:disableWifi()
+    end
+    logger.info("KOSyncWiFi:", kind, "sync done:", summary or "no Wi-Fi", "in", os.time() - started, "s")
+    return true
+end
+
+-- KOReader is quitting (PocketBook: power off, the firmware's automatic power
+-- off, Exit): push what is open before it is gone. Once per instance.
+function KOSyncWiFi:syncBeforeQuit()
+    if self.quit_synced then return end
+    self.quit_synced = true
+    if not self.settings.enabled or not self.settings.on_close then return end
+    if not (self:inReader() and self:getKOSync()) and queueCount() == 0 then return end
+    self:syncBlocking("exit")
 end
 
 -- The box drawn over the sleep screen: a plain square frame, serif text,
@@ -1453,6 +1638,12 @@ end
 
 function KOSyncWiFi:onResume()
     self:clearSleepScreenBox(true)
+    if self.wake_notice then
+        -- The sleep push went out while the firmware had the screen (PocketBook).
+        local settings, text = self.settings, self.wake_notice
+        self.wake_notice = nil
+        UIManager:scheduleIn(0.5, function() showPushed(settings, text) end)
+    end
     local suspend_job_pending = self.suspend_token ~= nil and Link.job ~= nil
     self.suspend_token = nil
     if not self.settings.enabled or not self.settings.on_resume then return end
@@ -1497,7 +1688,10 @@ end
 -- Broadcast before KOReader quits: Exit / Restart from the menu, power off,
 -- reboot, and "Close" right before entering USB mass storage. Returning
 -- nothing lets the event continue to the reader itself.
-local function markShutdown()
+local function markShutdown(self)
+    if Blocking.firmwareManagesPower() then
+        self:syncBeforeQuit()
+    end
     Link.shutdown()
 end
 KOSyncWiFi.onExit = markShutdown
@@ -1515,6 +1709,7 @@ local function statusText()
     end
     local kinds = {
         open = _("open"), close = _("close"), wake = _("wake"), sleep = _("sleep"), manual = _("manual"),
+        exit = _("exit"),
     }
     return T(_("Last sync: %1 at %2, %3"),
         kinds[last.kind] or last.kind,
@@ -1596,8 +1791,13 @@ function KOSyncWiFi:getSubItems()
         self:toggleEntry("on_open", _("Pull when opening a book")),
         self:toggleEntry("on_resume", _("Pull on wake-up")),
         self:toggleEntry("on_suspend", _("Push on sleep"),
-            _("Keeps the device awake (sleep screen already showing) until the push is done or the time limit is reached.")),
-        self:toggleEntry("on_close", _("Push when closing a book")),
+            Blocking.firmwareManagesPower()
+                and _("Runs right when the device goes to sleep, before the firmware's sleep screen; takes a few seconds.")
+                or _("Keeps the device awake (sleep screen already showing) until the push is done or the time limit is reached.")),
+        self:toggleEntry("on_close", _("Push when closing a book"),
+            Blocking.firmwareManagesPower()
+                and _("Also before KOReader quits with a book open: Exit, or Power off from KOReader's own menu (main tab, Exit). The power button stops KOReader without telling it, so nothing is pushed then; put the device in standby first.")
+                or nil),
         {
             text = _("Turn Wi-Fi off afterwards"),
             help_text = _("Only when the plugin turned it on. Wi-Fi that was already on is left alone."),
