@@ -155,7 +155,7 @@ local function resetKOSync()
     function kosync:getProgress() say("  [kosync] getProgress route=" .. tostring(wifi.route)) end
     function kosync:getDocumentDigest() return "digest1" end
     function kosync:getMetadata() return { title = "Vestigios" } end
-    function kosync:getLastProgress() return "/body/x" end
+    function kosync:getLastProgress() return "/body/p" .. tostring(self.page or 1) end
     function kosync:getLastPercent() return 0.5 end
     function kosync:onKOSyncToggleAutoSync(v) say("  [kosync] toggle auto sync", v) self.settings.auto_sync = false end
 end
@@ -191,6 +191,13 @@ package.searchpath = function() return "/plugins/kosync.koplugin/KOSyncClient.lu
 require = function(name) if stubs[name] ~= nil then return stubs[name] end return real_require(name) end
 
 local Plugin = dofile(PLUGIN)
+-- A PageUpdate normally comes with a new reading position; kosync.pin_pos
+-- models a re-pagination, where the page number changes and the position not.
+local real_onPageUpdate = Plugin.onPageUpdate
+Plugin.onPageUpdate = function(self, page)
+    if not kosync.pin_pos then kosync.page = page end
+    return real_onPageUpdate(self, page)
+end
 local Link = Plugin._Link
 Link.findScript = function() tickWifi() return wifi.script and wifi.script.pid end
 Link.killScript = function(pid) say("  [kill] script pid", tostring(pid)) wifi.script = nil end
@@ -268,6 +275,15 @@ local function newReader()
     return Plugin:new{ ui = ui }
 end
 local function newFM() return Plugin:new{ ui = { menu = menu } } end
+-- A reader past ReaderReady but without the open sync: page turns count from here.
+local function readyReader()
+    local p = newReader()
+    local on_open = p.settings.on_open
+    p.settings.on_open = false
+    p:onReaderReady()
+    p.settings.on_open = on_open
+    return p
+end
 
 local failures = 0
 local function check(cond, msg) if cond then say("  OK:", msg) else failures = failures + 1 say("  FAIL:", msg) end end
@@ -337,7 +353,7 @@ scenario("sleep, Wi-Fi never comes up", function()
 end)
 
 scenario("close a book offline: queue, then drain in background", function()
-    local p = newReader()
+    local p = readyReader()
     p:onPageUpdate(2)
     p:onCloseDocument()
     p = nil
@@ -621,7 +637,7 @@ end)
 scenario("close offline on a cold boot when the start-up fails: position stays queued", function()
     mtk()
     radio.hang.loader = true
-    local p = newReader()
+    local p = readyReader()
     p:onPageUpdate(2)
     p:onCloseDocument()
     advance(30)
@@ -698,7 +714,7 @@ scenario("wake: another script finishes normally and leaves Wi-Fi on", function(
 end)
 
 scenario("USB mass storage: Close aborts the job and stops the script", function()
-    local p = newReader()
+    local p = readyReader()
     p:onPageUpdate(2)
     p:onCloseDocument()
     advance(2)
@@ -724,7 +740,7 @@ scenario("USB mass storage while waiting for a foreign script: that script is st
 end)
 
 scenario("Close arrives before the close push: just queue", function()
-    local p = newReader()
+    local p = readyReader()
     p:onPageUpdate(2)
     p:onClose()
     p:onCloseDocument()
@@ -734,7 +750,7 @@ scenario("Close arrives before the close push: just queue", function()
 end)
 
 scenario("sleep while a close job is still connecting", function()
-    local p = newReader()
+    local p = readyReader()
     p:onPageUpdate(2)
     p:onCloseDocument()
     local fm = newFM()
@@ -817,6 +833,28 @@ scenario("legacy queue item with last_page_turn 0 is dropped as unread", functio
     local p = newFM()
     p:onResume() advance(30)
     check(#queue == 0 and lastLogHas("dropping a queued position for d1 - Xteink is ahead"), "dropped")
+end)
+
+scenario("the position restore while a book opens (PageUpdate before ReaderReady) is not a page turn", function()
+    local p = newReader()
+    p:onPageUpdate(7) -- ReaderRolling:onReadSettings restoring the position
+    p:onReaderReady() advance(30)
+    check(p:getLastPageTurn() == 0 and doc_settings_store.kosyncwifi_last_page_turn == nil, "no page-turn time recorded")
+    check(kosync.last_page_turn_timestamp == 0, "KOSync keeps the old time, so another device's newer progress still counts as newer")
+    check(not p:hasNewReading(), "nothing to push")
+    p:onPageUpdate(8)
+    check(p:getLastPageTurn() > 0 and p:hasNewReading(), "a real page turn after ReaderReady counts")
+end)
+
+scenario("re-pagination: a new page number at the same position is not a page turn", function()
+    local p = newReader()
+    p:onReaderReady() advance(30)
+    kosync.pin_pos = true
+    p:onPageUpdate(9) -- the EPUB finished rendering, the page count changed
+    kosync.pin_pos = false
+    check(p:getLastPageTurn() == 0 and not p:hasNewReading(), "not counted")
+    p:onPageUpdate(2)
+    check(p:hasNewReading(), "a change of position is")
 end)
 
 scenario("page-turn time survives reopening the book", function()
@@ -1132,7 +1170,7 @@ scenario("USB mass storage during our Wi-Fi start: the real stop runs before KOR
     })
     local stub = Link.killScript
     Link.killScript = real_killScript
-    local p = newReader()
+    local p = readyReader()
     p:onPageUpdate(2)
     p:onCloseDocument()
     advance(2)

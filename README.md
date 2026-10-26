@@ -112,8 +112,13 @@ event, and what happened ("pushed", "pulled", "not pushed: in sync",
   is one uninterrupted step, so a Bluetooth tap meanwhile is handled only once
   the radio is up.
 - **A push never undoes reading done elsewhere.** The plugin records when a
-  page was last turned in each book (per-book setting, survives reopening) and
-  hands that time to KOSync as well, which fixes KOSync's own forward/backward
+  page was last turned in each book (per-book setting, survives reopening). A
+  turn is a change of reading position:
+  the position restore while a book opens and the re-pagination when a large
+  EPUB finishes rendering change the page number without one, and do not
+  count (until 0.2.0 the restore did, so KOSync took another device's newer
+  progress for older and never offered to move forward). The time is handed
+  to KOSync, which fixes KOSync's own forward/backward
   decision on pull (KOSync only records page turns while its own automatic
   sync is on). Before every push, on sleep, on close or from the queue, the
   server is asked for its position first. Nothing is pushed when the server

@@ -1169,8 +1169,19 @@ function KOSyncWiFi:queuePosition(kosync)
 end
 
 function KOSyncWiFi:onPageUpdate(page)
-    if page == nil or not self:inReader() then return end
-    if self.last_page == page then return end
+    if page == nil or not self.ready or not self:inReader() then return end
+    -- Page numbers also change without anyone turning a page: when the
+    -- position is restored while the book opens (before ReaderReady, hence
+    -- the gate above) and when a large EPUB finishes rendering in the
+    -- background and is paginated again. The reading position does not, so a
+    -- turn is a change of position: KOSync's progress, the xpointer (or the
+    -- page, for fixed-layout documents). Counting those as turns made the
+    -- plugin tell KOSync this book was read "just now", so another device's
+    -- newer progress looked older and its forward prompt never came.
+    local kosync = self:getKOSync()
+    local pos = kosync and kosync:getLastProgress() or page
+    if pos == self.last_pos then return end
+    self.last_pos = pos
     self.last_page = page
     self.turns = (self.turns or 0) + 1
     local now = os.time()
@@ -1357,13 +1368,15 @@ function KOSyncWiFi:onReaderReady()
         })
     end
 
-    -- Reading-time tracking for this book.
+    -- Reading-time tracking for this book, from here on (see onPageUpdate).
     self.last_page = self.ui.getCurrentPage and self.ui:getCurrentPage()
+    self.last_pos = kosync:getLastProgress()
     local saved = self.ui.doc_settings and self.ui.doc_settings:readSetting(LAST_TURN_KEY)
     self.last_page_turn = tonumber(saved) or 0
     if (kosync.last_page_turn_timestamp or 0) == 0 then
         kosync.last_page_turn_timestamp = self.last_page_turn
     end
+    self.ready = true
 
     if self.settings.on_open then
         UIManager:nextTick(function()
